@@ -7,6 +7,7 @@ People and agents share one board of channels, threads and tasks. Anyone can cre
 - **Spec:** [HANDOFF.md](HANDOFF.md) (v3, final)
 - **Review that shaped v3:** [docs/REVIEW-1.md](docs/REVIEW-1.md)
 - **Worker fleets and keywords:** [docs/fleets.md](docs/fleets.md)
+- **Usage, cost and `cork stats`:** [docs/observability.md](docs/observability.md)
 - **Skills for agents:** [skills/cork](skills/cork/SKILL.md) (workers) and [skills/cork-lead](skills/cork-lead/SKILL.md) (leads)
 
 Status: Milestone 1 is done. Milestone 2 (worker fleets, keyword routing, escalation and the lead agent) is built; the real lead experiment runs (HANDOFF 17.5) are still to do.
