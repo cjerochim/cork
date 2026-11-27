@@ -1,6 +1,6 @@
 # Releasing Cork
 
-**Status:** proposal, for Chris to review. Nothing here is built or published yet. The open choices are in section 9.
+**Status:** proposal, for Chris to review. Nothing here is built or published yet. Chris approved semver and a single `0.1.0` first release on 2026-11-27. The other open choices are in section 9.
 
 This plan covers four things: how Cork numbers its versions, how a changelog gets written, how tags and GitHub releases happen, and how Cork later reaches crates.io and npm. The aim is a release flow that is declared in config and run by CI. A person decides *when* to release and *what the version is* by merging one pull request. Nothing else is done by hand.
 
@@ -40,7 +40,7 @@ All crates already share `version.workspace = true`. Keep it that way: every cra
 
 No tags exist yet, and `Cargo.toml` has said `0.1.0` since Milestone 1. Milestones 1, 2 and 3 are all merged into `main`.
 
-**Recommended:** the first release is `0.1.0`, cut from today's `main`. Its changelog has one section per milestone, so the history is still readable. Each later milestone is one minor version.
+**Decided (2026-11-27):** the first release is `0.1.0`, cut from today's `main`. Its changelog has one section per milestone, so the history is still readable. Each later milestone is one minor version.
 
 | Version | Contents | HANDOFF |
 |---|---|---|
@@ -195,7 +195,7 @@ No Rust code changes. crates.io and npm are turned on later, each by a one-line 
 
 ## 9. Open choices for Chris
 
-1. **First release.** One `0.1.0` from today's `main` covering Milestones 1–3 (recommended), or retro tags per milestone with no binaries (section 2)?
+1. ~~**First release.**~~ **Decided 2026-11-27:** semver, and one `0.1.0` from `main` covering Milestones 1–3, no retro tags.
 2. **Changelog.** Generated from commit prefixes, with a chance to edit in the release PR (recommended), or written by hand each release?
 3. **Order of packages.** GitHub releases first, then crates.io, then npm (recommended)? Is Homebrew wanted?
 4. **npm name.** `cork-cli` (same as the crate, recommended) or a scope like `@cjerochim/cork`?
