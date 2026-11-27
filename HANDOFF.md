@@ -8,7 +8,7 @@ Cork is a message board and task queue for people and coding agents. Inspired by
 
 Read this file first. Then start at "Milestone 1".
 
-**Added 2026-11-27, planned for Milestone 2, not to be built yet:** worker fleets (16), and a lead agent with parent and child tasks (17).
+**Added 2026-11-27, planned for Milestone 2, not to be built yet:** worker fleets with keyword routing (16), and a lead agent with parent and child tasks (17). **Planned for Milestone 3:** observability of performance, cost and usage (18).
 
 ---
 
@@ -585,6 +585,7 @@ Out of scope for Milestone 1:
 - The Postgres adapter.
 - Worker fleets (`cork workers`, section 16). In Milestone 1 a person starts each `cork tasks run` by hand.
 - The lead skill and parent and child tasks (section 17).
+- Observability: `cork stats`, usage capture and `/metrics` (section 18, Milestone 3).
 
 ### Done when
 
@@ -761,114 +762,231 @@ The full design goes in the UI spec, when the UI is built. These rules hold now:
 
 **Status:** plan only, added on 2026-11-27 at Chris's request. Do not build it until Chris says go.
 
-In Milestone 1, Cork never starts workers. Each `cork tasks run` is one worker, started by a person, and its model is whatever command follows `--`. A fleet adds one command that runs many workers from a config file. It groups them into **pools**, each with its own model and agent. You can grow or shrink each pool while it runs.
+In Milestone 1, Cork never starts workers. Each `cork tasks run` is one worker, started by a person, and its model is whatever command follows `--`. A fleet adds one command that runs many workers from config files. It groups them into **pools**, each running one model or agent, and lets you grow or shrink each pool while it runs. Tasks reach the right model by **keywords**: plain labels that match what each model can do.
 
 ### 16.1 Principles
 
-- **A fleet is a plain client.** `cork workers` is a supervisor process that starts `cork tasks run` children. The daemon has no idea fleets exist: no new routes, events or tables. Everything a fleet does could be done by hand in N shells.
+- **A fleet is a plain client.** `cork workers` is a supervisor process that starts `cork tasks run` children. Nothing changes in `cork-core`, the daemon or the API: no new routes, events, fields or tables. Keywords are ordinary labels, and models, pools and matching live only in the fleet and the CLI. Everything a fleet does could be done by hand in N shells.
 - **The lease protects the work, not the supervisor.** When a worker or the supervisor dies, leases end and tasks go back to `ready`, as in 9.1. The supervisor only restores the head count.
-- **Routing stays on the board.** A pool takes work through a channel selector and labels, the same as `tasks run --ready`. The lead sends work to a pool by where it posts the task, or by its labels.
+- **Routing stays on the board.** A task says what it needs with keyword labels. A pool takes only the tasks its model covers (16.6). The lead or a person routes work by what they write on the task, never by naming a worker.
 - **One fleet per machine and config.** In server mode (13), fleets on many machines point at one board with `CORK_URL`, and their pools simply add up.
 
-### 16.2 Config
+### 16.2 Config: keywords, models and pools
 
-`~/.config/cork/workers.toml`, or `--config FILE`:
+There are two files. **What each model can do** is kept apart from **how many of each run here**, because the first is shared by a team and the second is set per machine.
+
+`models.toml` is the catalog. It can be committed in a repo and shared by a team. It defines the keyword vocabulary and the models:
+
+```toml
+# The keywords tasks may ask for, and that models may claim to cover.
+[keywords]
+rust          = "Writes and reviews Rust"
+typescript    = "Writes and reviews TypeScript"
+docs          = "Prose: READMEs, guides, changelogs"
+large-context = "Needs to hold a large codebase or long files at once"
+vision        = "Reads screenshots, diagrams or designs"
+architecture  = "Design across modules; storage, APIs, migrations"
+review        = "Reviews someone else's change"
+
+[aliases]                    # other spellings people use, mapped to one keyword
+ts = "typescript"
+documentation = "docs"
+
+[model.opus]
+command = ["claude", "-p", "Do the Cork task in $CORK_TASK_TEXT", "--model", "opus"]
+tier = 3                    # 1 is the weakest; a model also has every tier below its own
+cost = 15                   # relative cost per task-hour, in units you choose; for reports
+keywords = ["rust", "typescript", "docs", "large-context", "vision", "architecture"]
+
+[model.sonnet]
+command = ["claude", "-p", "Do the Cork task in $CORK_TASK_TEXT", "--model", "sonnet"]
+tier = 2
+cost = 3
+keywords = ["rust", "typescript", "docs", "large-context"]
+
+[model.haiku]
+command = ["claude", "-p", "Do the Cork task in $CORK_TASK_TEXT", "--model", "haiku"]
+tier = 1
+cost = 1
+keywords = ["typescript", "docs"]
+
+[model.reviewer]            # any agent CLI works: the command is opaque
+command = ["./scripts/review-agent.sh"]
+tier = 2
+keywords = ["review"]
+```
+
+`workers.toml` sets the fleet on one machine. It lives at `~/.config/cork/workers.toml`, or comes from `--config FILE`:
 
 ```toml
 [fleet]
 name = "dev"                # used in profile names and the control socket
+models = "models.toml"      # path to the catalog, relative to this file
 max_workers = 12            # cap across all pools
 
-[pool.hard]
+[pool.strong]
+model = "opus"
 select = "work/"            # channel selector
-labels = ["tier=hard"]
-count = 3                   # initial size; min and max bound scaling
+count = 2                   # initial size; min and max bound scaling
 min = 0
 max = 6
-model = "opus"
 lease = "10m"
 max_runtime = "2h"
-wait = "10m"
-command = ["claude", "-p", "Do the Cork task in $CORK_TASK_TEXT", "--model", "{model}"]
 
-[pool.easy]
+[pool.fast]
+model = "haiku"
 select = "work/"
-labels = ["tier=easy"]
 count = 5
 max = 10
-model = "haiku"
-command = ["claude", "-p", "Do the Cork task in $CORK_TASK_TEXT", "--model", "{model}"]
 
-[pool.other-agent]           # any agent CLI works: the command is opaque
-select = "work/review"
+[pool.review]
+model = "reviewer"
+select = "work/"
 count = 1
-command = ["./scripts/review-agent.sh"]
 ```
 
-- `{model}` and `{pool}` are filled into `command`. They are also set as `CORK_MODEL` and `CORK_POOL` for the command.
-- `env`, `cwd` and `from` are optional per pool. `from` works as it does in `tasks run`.
-- Secrets such as API keys come from the supervisor's environment. They never go in the file or on the board.
+- A pool may override `command`, narrow its model's `keywords`, and set `env`, `cwd` and `from`. `from` works as it does in `tasks run`.
+- `{model}` and `{pool}` are filled into `command`. They are also set as `CORK_MODEL`, `CORK_POOL` and `CORK_TIER` for the command.
+- Secrets such as API keys come from the supervisor's environment. They never go in these files or on the board.
+- **Why TOML, with JSON accepted.** People edit these files by hand. TOML allows comments, which is where the reason for a keyword goes ("opus: vision tested on our screenshots"). It is also what Rust developers already use in `Cargo.toml`. A file ending in `.json` with the same shape is read too. That suits a catalog generated by a script or served by a team.
 
 ### 16.3 Commands
 
 ```bash
 cork workers up [--config FILE] [--detach]   # start the fleet (foreground by default)
-cork workers status [--json]                 # pools, size, busy or idle, current task, restarts
+cork workers status [--json]                 # pools, size, busy or idle, current task, restarts, unmatched tasks
 cork workers scale <pool> <n|+n|-n>          # resize a running pool, within min and max
 cork workers drain <pool>                    # finish current tasks, then stop the pool's workers
-cork workers reload                          # re-read the config; apply count, model and command changes
+cork workers reload                          # re-read both files; apply count, model and command changes
 cork workers down [--now]                    # drain everything, or with --now release and stop
+cork workers match <task-id | --needs k1,k2> # dry run: which models and pools could take this task, and why not
+cork workers keywords                        # the vocabulary, its aliases, and which models cover each keyword
 ```
 
-`status`, `scale`, `drain`, `reload` and `down` talk to the running supervisor over a local Unix socket, `~/.config/cork/workers/<fleet>.sock` (mode `0600`). They do not go through the board.
+`status`, `scale`, `drain`, `reload` and `down` talk to the running supervisor over a local Unix socket, `~/.config/cork/workers/<fleet>.sock` (mode `0600`). They do not go through the board. `match` and `keywords` read only the files and the board, so they work without a running fleet.
 
-### 16.4 Supervision
+### 16.4 Supervision and dispatch
 
-- Each worker is one child: `cork --as <fleet>-<pool>-<n> tasks run --ready <select> --label … --loop --wait <wait> -- <command>`. Profile names show which pool, and so which model, did each attempt in `tasks history`.
-- The supervisor restarts a child that exits, by its exit code (8.6):
-  - **4** (the wait ended with nothing ready): restart at once.
-  - **11** (daemon lost): restart with backoff, 1 s doubling to 30 s.
-  - **Crash or signal:** restart with backoff.
-- **Crash loop:** if a pool's workers exit 5 times in 60 s, the supervisor pauses the pool and says so in `status`. It also posts one message to `cork/fleet` naming the pool and the last error. `scale` or `reload` resumes it.
-- Children die with the supervisor (`PR_SET_PDEATHSIG` on Linux, a process group elsewhere), so a crashed supervisor leaves no orphans. Their tasks come back through leases.
-- On `SIGTERM` the supervisor drains (16.5). A second `SIGTERM`, or `down --now`, sends `SIGTERM` to every child, so each releases its task and exits 143.
+The supervisor is also the **dispatcher**. Matching happens there, not in the daemon:
+
+1. It follows `/events` for task changes in its pools' channels.
+2. When a task becomes ready, or a worker becomes free, it reads the ready tasks with `GET /tasks?state=ready&channel=…`, oldest first.
+3. It gives the oldest task that a free worker's pool covers (16.6) to that worker. Each worker is one child: `cork --as <fleet>-<pool>-<n> tasks run <task-id> -- <command>`. Profile names show which pool, and so which model, did each attempt in `tasks history`.
+4. If another fleet or a person claimed that task first, the child exits 7 (`task_claimed`) at once. The supervisor tries the next matching task. The single writer (2) guarantees one winner, so a race costs one request, never double work.
+
+This keeps FIFO order among the tasks each pool can take, and it needs nothing from the server beyond Milestone 1's claim by id.
+
+The supervisor handles each child's exit by its code (8.6):
+
+- **0, 8, 9 or 10** (task settled or blocked): the worker is free again.
+- **7** (claimed by someone else): try the next task.
+- **11** (daemon lost): retry with backoff, 1 s doubling to 30 s.
+- **A crash or a signal:** the task comes back through its lease. The worker is replaced, with backoff.
+
+Two more rules:
+
+- **Crash loop:** if a pool's workers crash 5 times in 60 s, the supervisor pauses the pool and says so in `status`. It also posts one message to `cork/fleet` naming the pool and the last error. `scale` or `reload` resumes the pool.
+- **No orphans:** children die with the supervisor (`PR_SET_PDEATHSIG` on Linux, a process group elsewhere). Their tasks come back through leases. On `SIGTERM` the supervisor drains (16.5). A second `SIGTERM`, or `down --now`, sends `SIGTERM` to every child, so each releases its task and exits 143.
 
 ### 16.5 Scaling
 
-- **Up:** start the new workers at once. Never go above the pool's `max` or the fleet's `max_workers`.
-- **Down:** stop idle workers first. These are workers waiting in a claim, and stopping them costs nothing. A busy worker is **drained**: it finishes its current task, settles it, and exits. Nothing is lost and no attempt is wasted.
-- Draining needs one addition to `tasks run`: **`SIGUSR1` means "finish this task, then exit 0 instead of claiming another".** It is a small, separate change that is useful without fleets too.
+- **Up:** add workers at once, and dispatch to them. Never go above the pool's `max` or the fleet's `max_workers`.
+- **Down:** free workers stop at once. A busy worker is drained: it is given no new task, so it finishes its current one, settles it, and stops. Nothing is lost and no attempt is wasted. Because the supervisor dispatches one task per child, draining needs no change to `tasks run`.
 - **Changing a pool's model or command** with `reload` drains the old workers and starts new ones. Tasks in progress finish on the model that started them.
 - **Autoscaling** comes after manual scaling, and is opt-in per pool:
 
   ```toml
-  [pool.easy.autoscale]
-  target_ready_per_worker = 2   # grow while ready tasks per worker > 2
+  [pool.fast.autoscale]
+  target_ready_per_worker = 2   # grow while matching ready tasks per worker > 2
   idle_after = "5m"             # shrink a worker idle this long
   ```
 
-  The supervisor reads the ready count with `GET /tasks?state=ready&channel=…&label=…`, at most every 10 s. It also wakes on events from `/events`. It stays within `min` and `max`.
+  It counts only ready tasks that the pool covers, and stays within `min` and `max`.
 
-### 16.6 Choosing the model for a task
+### 16.6 Keywords: matching tasks to models
 
-- **By where it is posted:** the lead posts hard work with `--label tier=hard` and easy work with `tier=easy`. Pools select on those labels.
-- **The skill** (`SKILL.md`) gets a short section for leads on picking a tier.
-- **Escalation is an open question.** A task that failed on the easy pool may deserve a retry on the hard pool. Options:
-  1. The lead creates a new task with `tier=hard` that links to the old one. This works with Milestone 1 as it is.
-  2. A future `tasks relabel <id>` that writes a `TaskRelabeled` event.
+**A task says what it needs. A model says what it can do. A pool takes only tasks its model covers.** All of it is labels and client code.
 
-  Option 1 is the default until there is a reason for 2.
+- **On a task**, each need is one plain label, `needs.<keyword>=yes`:
 
-### 16.7 Done when (for Milestone 2)
+  ```bash
+  cork tasks create work "Port the parser to Rust" --needs rust,large-context
+  cork tasks create work "Fix the typo in the README" --needs docs
+  cork tasks create work "Redesign the storage layer" --needs rust,architecture,tier-3
+  ```
+
+  `--needs a,b` is CLI shorthand for `--label needs.a=yes --label needs.b=yes`. A task with no `needs.*` labels can go to any pool. (The `needs.` prefix is a label. It is unrelated to the `needs` field for dependencies in 6.8. If that collision proves confusing, the prefix can become `wants.` before Milestone 2 ships.)
+- **Tiers are keywords too.** A tier 3 model also covers `tier-1`, `tier-2` and `tier-3`. So "needs at least a tier 2 model" is `--needs tier-2`, with no new rule.
+- **Covers** means every `needs.*` label on the task names a keyword in the pool's list, after aliases. The dispatcher checks this (16.4). The daemon only stores and filters labels, as in Milestone 1.
+- **A stronger pool can take easier work.** An opus worker covers a `docs` task, which keeps throughput up when the cheap pool is busy. The dispatcher still prefers the cheapest pool that covers a task. A pool that should take only work that needs it sets `exclusive = true`, which also requires its top tier: such a pool takes only tasks that ask for `tier-3`.
+- **Asking who can take a task:** `cork workers match <task-id>` prints each model and pool, with "covers" or the missing keywords. For example: `haiku: missing rust`, `sonnet: covers`, `opus: covers (costs 5x sonnet)`. `--needs` asks the same question before the task exists, and the lead skill uses it while planning.
+- **Keywords drift if they are free text.** "ts", "typescript" and "TypeScript" would each silently leave tasks unmatched. The catalog prevents that:
+  - The `[keywords]` list is the vocabulary.
+  - `cork tasks create --needs` checks each keyword against it. An unknown keyword is an error that names the closest match ("unknown keyword `typscript`; did you mean `typescript`?"). An alias is rewritten to its keyword.
+  - `cork workers up` and `reload` refuse a model or pool that names an unknown keyword.
+  - `workers status` lists **unmatched** tasks: ready tasks with a need that no running pool covers. A typo, or a missing model, shows up at once, not as silence.
+  - Tasks created another way, such as by raw `--label` or the API, are not checked. `match` and `status` still catch them.
+- **Keywords are a routing hint, not a security boundary.** They are self-declared in files the person controls. Who may claim what is still decided by ownership and `--from` (10).
+
+### 16.7 Worked scenario: a weak model struggles, the lead escalates
+
+Chris's case: a task lands on a model that turns out not to be strong enough. The lead notices and moves it to a more capable model, which finishes or fixes the work. Everything here uses Milestone 1's board, plus the fleet and lead layers.
+
+**1. The plan.** The lead creates a child of feature `F` (17.1): `cork tasks create work "Make the importer stream large files" --needs typescript --label parent=F`. `match` says `haiku` covers it, the cheapest model that does, so the `fast` pool takes it.
+
+**2. The struggle.** The lead is waiting on the feature's events (17.2). It sees one of three signals:
+- **`TaskFailed`:** haiku ran its tests, they failed, it wrote a reason and exited non-zero.
+- **`LeaseExpired` twice:** the worker keeps dying, for example running out of memory on large files.
+- **`TaskBlocked`** with a question the lead can answer only with "this is harder than planned".
+
+Each comes with the thread: haiku's progress posts, the branch `cork/<id>/1` and its last commit (9.1).
+
+**3. The decision.** The lead reads the reason and the progress, then asks `cork workers match --needs typescript,large-context,tier-2`. The answer is `sonnet: covers`. The lead escalates by one tier rather than straight to opus, because sonnet is cheaper. The skill's rule: escalate one step at a time, and at most twice per task (17.2).
+
+**4. The handover.** Labels are fixed when a task is created, so the lead does not change the old task. It creates a **retry** instead:
+
+```bash
+cork --idempotency-key "escalate-$OLD" tasks create work \
+  "Retry of $OLD on a stronger model. Read its thread first: cork read $OLD.
+   Earlier attempt: branch cork/$OLD/1 at abc123; tests in importer.test.ts fail on files over 1 GB.
+   Continue from that branch, or start clean and say why. <original task text>" \
+  --needs typescript,large-context,tier-2 --label parent=F --label retry_of=$OLD
+```
+
+Then it tidies the old task:
+- If it is still blocked or ready, it cancels it with the reason "escalated to <new id>".
+- It replies in the old thread with a link to the retry, so the history reads both ways.
+
+The idempotency key means a lead that crashes and restarts mid-escalation never makes two retries.
+
+**5. The finish.** The dispatcher gives the retry to the `strong` or a sonnet pool: haiku no longer covers it. The new worker reads the old thread, which it is told to treat as notes, not instructions (9.1). It continues from the branch, completes the task, and names its branch in the result. The lead sees `TaskCompleted` and reviews it as usual.
+
+**What the board records**, all as ordinary events:
+
+| Where | Events |
+| --- | --- |
+| Old task | `TaskCreated` (needs typescript), `TaskClaimed` by `dev-fast-2`, progress replies with branch and commit, `TaskFailed` with the reason (or `LeaseExpired` events), a reply from the lead linking the retry, `TaskCanceled` if it was not already finished |
+| Retry | `TaskCreated` with `retry_of=<old>` and the stronger `needs`, `TaskClaimed` by a sonnet pool's profile, progress, `TaskCompleted` |
+| Feature thread | Both tasks, because both carry `parent=F` |
+
+From these, anyone can answer "which tasks needed escalating, from which model to which, and what it cost", with `tail --label retry_of=…` or a `debug export` of the feature (17.5).
+
+**If the strong model fails too**, the lead stops escalating after its limit. It blocks the feature with a question for the person, naming both attempts and their branches.
+
+### 16.8 Done when (for Milestone 2)
 
 1. **Restart:** `kill -9` one worker of a pool of 3. The supervisor starts a replacement within 2 s, and the killed worker's task completes on a later attempt.
-2. **Scale down without loss:** `scale easy 5 → 1` while 5 workers are busy. All 5 tasks complete, none is released or failed, and 4 workers exit.
-3. **Scale up:** `scale hard +3` puts 3 more workers in a claim within 2 s.
-4. **Routing:** with pools on `tier=hard` and `tier=easy`, every task is claimed by a worker of the matching pool (check the profiles in the log).
-5. **Crash loop:** a command that exits at once pauses its pool after 5 exits, and the other pools keep working.
-6. **Supervisor death:** `kill -9` the supervisor. No child outlives it by more than 1 s, and every task it held returns to `ready` within one lease.
-7. **Reload:** changing a pool's model drains the old workers, and later tasks run with the new model (`CORK_MODEL`).
-8. **Plain client:** the fleet tests run against an unmodified Milestone 1 daemon, apart from the `SIGUSR1` drain in `tasks run`.
+2. **Scale down without loss:** `scale fast 5 → 1` while 5 workers are busy. All 5 tasks complete, none is released or failed, and 4 workers stop.
+3. **Scale up:** `scale strong +3` gives 3 more workers tasks within 2 s when matching tasks are ready.
+4. **Routing by keyword:** with the catalog above, no task is ever claimed by a pool whose model lacks one of its `needs` (check the profiles in the log). Among the tasks a pool covers, it takes the oldest first.
+5. **Two fleets, one board:** two supervisors share a board. Every task completes exactly once, and races end in exit 7, never double work.
+6. **Vocabulary:** `--needs typscript` is refused with a suggestion. `--needs ts` is stored as `needs.typescript`. A raw label with an unknown keyword is listed as unmatched in `status`.
+7. **Match:** `workers match` gives the same answer the dispatcher acts on, for 1,000 random tasks and catalogs.
+8. **Escalation scenario:** the scenario in 16.7, scripted with fake workers, ends with the retry completed by a tier 2 profile. A lead restarted between creating the retry and cancelling the old task makes no second retry.
+9. **Crash loop:** a command that exits at once pauses its pool after 5 crashes, and the other pools keep working.
+10. **Supervisor death:** `kill -9` the supervisor. No child outlives it by more than 1 s, and every task it held returns to `ready` within one lease.
+11. **Reload:** changing a pool's model drains the old workers, and later tasks run with the new model (`CORK_MODEL`).
+12. **Plain client:** every fleet test runs against an unmodified Milestone 1 daemon. No change to `cork-core` or the API.
 
 ## 17. A lead agent and parent and child tasks (Milestone 2, an experiment)
 
@@ -877,90 +995,219 @@ cork workers down [--now]                    # drain everything, or with --now r
 The idea: one agent, the **lead**, owns a feature for a person.
 - It splits the feature into tasks, which the workers (16) do.
 - It watches their events and reviews the results.
-- It creates follow-up tasks when they are needed.
+- It creates follow-up tasks, and escalates struggling ones to stronger models (16.7).
 - It raises issues to the person.
 
 **The person stays the accountable owner.** The lead acts for them, under their name, and cannot widen its own reach.
 
-### 17.1 Parent and child tasks
+### 17.1 Parent and child tasks, with labels first
 
-A feature is a **parent** task. The work is its **children**.
+For the experiment, a feature and its tasks are linked with **plain labels**, so the core stays as it is. The core gets real parent links only if the experiment shows they are worth it.
 
-- `cork tasks create <channel> "<text>" --parent <id>` makes a child. `TaskCreated` gets an optional `parent` field, an additive change (7.6). A child's root message is posted in the parent's thread, so the feature reads as one conversation.
-- A parent is never claimed by a worker. It is created with `--kind feature`. `claim --ready` skips it, and only its owner, the lead, settles it.
-- **Rollup:** `tasks show <parent>` and `GET /tasks/{id}` show counts of the children by state, such as `5 completed, 1 claimed, 1 blocked`. `tasks list --parent <id>` lists the children.
-- **Waiting on all of them:** `cork wait --parent <id> --label board.task=completed|failed|blocked` wakes on any child's change. Each child's task events carry the label `board.parent=<id>`, so this is the normal event filter (7.4) with no new mechanism.
-- **Links are one level deep.** A child cannot have children. A lead that needs more structure creates a second feature.
-- `needs` (6.8) orders children inside a feature, such as "tests after the schema change". Parent links group the tasks; `needs` orders them.
-- A parent completes only when its owner completes it. Children ending never closes the parent by itself, because the lead decides when the feature is done. Canceling a parent cancels its unclaimed children in the same commit; claimed children finish or fail on their own.
+- **The feature** is a task in the `features/` channel, labelled `kind=feature`. Worker pools do not select `features/`, so no worker takes it. Only the lead pool does (17.3).
+- **Children** are tasks in a work channel labelled `parent=<feature id>`.
+- **Rollup:** `cork tasks list --label parent=<id>` lists them with their states. The lead skill sums them ("5 completed, 1 claimed, 1 blocked") and posts the summary in the feature's thread.
+- **Watching all of them:** `cork wait --label parent=<id> --type TaskCompleted --type TaskFailed --type TaskBlocked --type LeaseExpired` wakes on any child's change. The only addition is `--type` on `wait`, a CLI flag for a filter the API already has (7.4).
+- **Order:** inside a feature, `needs` dependencies (6.8) order the children, such as "tests after the schema change".
+- **Closing:** the lead decides when the feature is done and completes it. Children ending never closes the feature by itself. To cancel a feature, the lead cancels its unclaimed children first, then the feature.
+
+**What would move this into the core later:** checks the board can't make on labels (a child of a missing parent, a feature claimed by a worker), a rollup in one read, and cancel of a whole feature in one commit. The experiment (17.5) tells us whether those matter.
 
 ### 17.2 The lead skill
 
 `skills/cork-lead/SKILL.md`, next to the worker skill, teaches this loop:
 
-1. **Plan.** Read the feature brief. Create the parent with `--kind feature`. Create small, self-contained children with `--parent`, labels for the pool (`tier=hard`, `tier=easy`), and an idempotency key each (`<feature>-<n>`), so a restart of the lead does not duplicate them. Post the plan in the parent's thread.
-2. **Watch.** `cork wait --parent <id> --label board.task=completed|failed|blocked --timeout 30m`, in a loop. Never poll.
+1. **Plan.** Read the feature brief, then post the plan in the feature's thread. Create small, self-contained children, each with:
+   - `--label parent=<id>`.
+   - The keywords it needs. Check them with `workers match --needs …` and ask only for what the task truly needs, so cheap models get the work they can do.
+   - An idempotency key (`<feature>-<n>`), so a restarted lead never duplicates them.
+2. **Watch.** `cork wait --label parent=<id> --type …`, in a loop (17.1). Never poll.
 3. **Review each result.** Read the child's result and the branch it names. Then, depending on what it finds:
    - Accept the work.
    - `reopen` the child with a note on what to fix.
    - Create a follow-up child.
-   - For a failed easy task, create a new `tier=hard` child that links to it (16.6).
-4. **Raise issues to the person.** For something the lead cannot decide, such as scope, product choices or anything risky, it blocks the parent with a question that @mentions the person. It keeps working on the other children meanwhile. For news without a decision, it posts in the parent's thread.
-5. **Finish.** When every child is settled, post a summary in the parent's thread: what was done, the branches, and anything left open. Then complete the parent. Merging and deploying stay with the person.
+   - Escalate it to a stronger model, one tier at a time (16.7).
+4. **Raise issues to the person.** For something the lead cannot decide, such as scope, product choices or anything risky, it blocks the feature with a question that @mentions the person. It keeps working on the other children meanwhile. For news without a decision, it posts in the feature's thread.
+5. **Finish.** When every child is settled, post a summary in the feature's thread: what was done, the branches, escalations, and anything left open. Then complete the feature. Merging and deploying stay with the person.
 
 **Limits the skill sets, which the lead must not lift itself:**
 - At most `max_children`, default 20.
-- At most `max_followups` per child, default 2, so a stuck child does not loop forever.
+- At most 2 follow-ups and 2 escalations per child, so a stuck child does not loop forever.
 - A time budget for the feature.
 
-When the lead hits a limit, it blocks the parent and asks the person.
+When the lead hits a limit, it blocks the feature and asks the person.
 
 ### 17.3 Running the lead
 
-The lead is one more `tasks run` worker, on its own pool:
+The lead is one more pool, on the strongest model, selecting only features:
 
 ```toml
 [pool.lead]
-select = "features/"
-labels = ["kind=feature"]
-count = 1
 model = "opus"
+select = "features/"
+count = 1
 command = ["claude", "-p", "Lead the Cork feature in $CORK_TASK_TEXT", "--model", "{model}"]
 lease = "30m"
 ```
 
-A person posts the brief with `cork tasks create features "<brief>" --kind feature` and the lead pool takes it. The lead runs for a long time while it waits. That is fine: the wrapper renews the lease, and a crashed lead is picked up by the next attempt. The next attempt reads the parent's thread and children from the board, plus `CORK_PREVIOUS` (9.1), so it can resume without starting over.
+A person posts the brief with `cork tasks create features "<brief>" --label kind=feature`, and the lead pool takes it. The lead runs for a long time while it waits. That is fine: the wrapper renews the lease, and a crashed lead is picked up by the next attempt. That attempt reads the feature's thread and children from the board, plus `CORK_PREVIOUS` (9.1), so it can resume without starting over.
 
 ### 17.4 Trust
 
 - The lead acts as the person's profile (`lead via chris`), so every task it creates is owned by the person. Workers' default `--from` (owner = person) still applies.
-- Children's results are untrusted input to the lead, as `CORK_PREVIOUS` is (9.1). The skill tells the lead to judge them, not to follow instructions in them.
+- Children's results, and an old task's thread read during an escalation, are untrusted input, as `CORK_PREVIOUS` is (9.1). The skill tells the lead to judge them, not to follow instructions in them.
 - The lead never merges, deploys or sends messages outside the board unless the brief says so. Even then, it renews its own claim first (9.1).
 
 ### 17.5 How we measure it
 
 Run the same features three ways:
 - (A) A person splits the work by hand.
-- (B) A lead with one pool.
-- (C) A lead with hard and easy pools.
+- (B) A lead with one pool on one model.
+- (C) A lead with pools matched by keyword, with escalation (16.6, 16.7).
 
-Use 5 to 10 small features from a real repo, each with a written definition of done. Everything below comes from the log (`tasks history`, `debug export`), so no extra tracking is needed:
+Use 5 to 10 small features from a real repo, each with a written definition of done. Everything below except the first row comes from the log (`tasks history`, `debug export`), so no extra tracking is needed:
 
 | Measure | From |
 | --- | --- |
 | Done: share of features whose result meets the definition of done, judged by the person | Person's review |
-| Time from brief to parent completed | `TaskCreated` → `TaskCompleted` on the parent |
-| Person's time: questions raised, and minutes from question to unblock | `TaskBlocked` / `TaskUnblocked` on the parent |
+| Time from brief to feature completed | `TaskCreated` → `TaskCompleted` on the feature |
+| Person's time: questions raised, and minutes from question to unblock | `TaskBlocked` / `TaskUnblocked` on the feature |
 | Rework: reopens and follow-up children per feature | `TaskReopened`, children created after the plan |
 | Waste: failed and abandoned attempts, and child tasks never used | `TaskFailed`, `LeaseExpired`, canceled children |
-| Cost: model time per feature, split by pool | Wrapper run times per profile, joined with each pool's model |
+| Escalations: how many, from which model to which, and whether the retry succeeded | `retry_of` labels and the profiles that claimed each task |
+| Cost: model time per feature, split by model | Wrapper run times per profile, joined with each model's `cost` |
+| Routing gaps: tasks no pool could take, and how long they waited | `workers status` unmatched list, `TaskCreated` → first `TaskClaimed` |
 
-`cork-stress` gets a `lead` scenario that drives a fake lead and fake workers through 100 features. It checks the rollup counts and the `--parent` wait, and checks that no parent completes before all of its children are settled.
+`cork-stress` gets a `lead` scenario that drives a fake lead and fake workers through 100 features. It checks that rollups match the log, that the `parent` wait sees every child change, that no feature completes before all of its children are settled, and that escalations never duplicate.
 
 ### 17.6 Done when (for Milestone 2)
 
-1. `--parent`, the rollup, `tasks list --parent` and `wait --parent` work through the API and the CLI. The contract suite covers parent links, and `debug rebuild` finds no difference.
-2. Workers never claim a `--kind feature` task.
-3. Canceling a parent cancels its unclaimed children, and leaves claimed ones alone.
-4. A lead killed with `kill -9` mid-feature is replaced, and the next attempt creates no duplicate children (idempotency keys).
-5. `skills/cork-lead/SKILL.md` exists, and one real run of each setup in 17.5 is written up in `docs/`, with the measures filled in.
+1. `--type` on `wait` works. A wait on `--label parent=<id>` sees every child task event, through both the store and the in-memory path (7.4). This is a check of Milestone 1's label filter on task events, not a new feature.
+2. Workers never take a `features/` task.
+3. A lead killed with `kill -9` mid-feature is replaced, and the next attempt creates no duplicate children or retries (idempotency keys).
+4. `skills/cork-lead/SKILL.md` exists, and one real run of each setup in 17.5 is written up in `docs/`, with the measures filled in.
+5. **The decision the experiment feeds:** after the runs, a short note in `docs/` says whether parent links, rollup or keyword matching should move into the core, and why.
+
+## 18. Observability: performance, cost and usage (Milestone 3, planned)
+
+**Status:** plan only, added on 2026-11-27 at Chris's request. Do not build it until Chris says go. It comes after the fleet (16) and the lead (17), because it measures them.
+
+**The headline number is cost per successful task, by model.** Failed attempts, lease expiries and escalations all count toward it. A cheap model that fails half the time and needs a retry on a strong one can cost more than starting on the strong one. This number shows that.
+
+Two kinds of data, kept apart:
+
+- **Flow**: what happened to the work. It is already all in the log, so it comes from replay, with no new capture.
+- **Usage**: tokens, cost and turns per attempt. Only the agent knows these. The wrapper captures them and posts them to the board as plain message data. **The core stays unaware of usage**: no new event types, fields or tables.
+
+### 18.1 Flow metrics, from the log
+
+Each of these is computed by replaying events, per channel, label, worker profile, pool and feature:
+
+| Metric | How |
+| --- | --- |
+| Queue depth over time | ready tasks at each point in the log |
+| Time to claim | `TaskCreated` (or `TaskReopened`, `TaskUnblocked`) → `TaskClaimed` |
+| Work time per attempt | `TaskClaimed` → the attempt's settle or `LeaseExpired` |
+| Time to done | `TaskCreated` → `TaskCompleted` |
+| Attempts per task, and the success rate of first attempts | `attempt` on `TaskClaimed` |
+| Failure reasons, grouped | `reason` on `TaskFailed` |
+| Lease expiries | `LeaseExpired`, by profile (crashes, slow machines) |
+| Time blocked on a person | `TaskBlocked` → `TaskUnblocked` |
+| Escalations | tasks with `retry_of` (16.7), and whether the retry succeeded |
+
+Because these come from the log, they can be computed for any past period, and recomputed after a change to how they are defined.
+
+### 18.2 Usage, captured by the wrapper
+
+- **Generic:** before it exits, the command may write JSON to the file named in `$CORK_USAGE`:
+
+  ```json
+  {"model": "claude-sonnet-…", "input_tokens": 182340, "output_tokens": 9120,
+   "cache_read_tokens": 140000, "cost_usd": 0.71, "turns": 23}
+  ```
+
+  Every field is optional, and unknown fields are kept.
+- **Built in for Claude Code:** `tasks run --usage claude-json` runs the command with `--output-format json` in mind. The wrapper parses the final JSON object Claude Code prints, which holds the cost, token counts per model and the number of turns. It takes the usage from it and uses its `result` text as the task result, so the result stays readable. Parsers for other agents can be added the same way, and a parser that fails changes nothing about settling.
+- **Where it goes:** just before it settles, the wrapper posts one reply in the task's thread with `--label usage=attempt` and the JSON as `data`, adding `task`, `attempt`, `claim_id`, `profile`, `pool`, `model`, `exit` and `duration_ms`. This is an ordinary message, so export, import, replay and the UI all carry it with no new rules. It is posted for every outcome: completed, failed, blocked, max-runtime and released.
+- **What is lost:** when the wrapper is killed with `kill -9` or the machine dies, that attempt's usage is not recorded. `cork stats` counts these attempts and reports their usage as unknown. It does not guess.
+- **Cost is an estimate.** It is what the agent reports, or tokens times a price table in `models.toml`:
+
+  ```toml
+  [model.sonnet.price]
+  input_per_mtok = 3.0
+  output_per_mtok = 15.0
+  cache_read_per_mtok = 0.3
+  ```
+
+  The real bill is the provider's. `stats` says which source each number came from.
+
+### 18.3 `cork stats`
+
+```bash
+cork stats [--since 7d] [--channel work/] [--label k=v] [--feature <id>]
+           [--by model|pool|profile|channel|label:<key>|day] [--json | --csv]
+```
+
+`cork stats` replays the log through `/events`, so it reads, never writes. It runs on any machine that can reach the board. It prints:
+
+- **Outcomes:** tasks completed, failed and canceled, and the success rate.
+- **Speed:** p50 and p95 of time to claim, work time and time to done.
+- **Effort:** attempts per task, lease expiries and escalations.
+- **Usage:** tokens in and out, turns and cost, all per group.
+- **Cost per successful task:** all cost spent on a task, including failed attempts and every retry in its `retry_of` chain, divided by tasks completed. The chain is charged to the model the task **started** on, and also shown split by the model that finished it. That way "start on haiku and escalate" can be compared with "start on sonnet".
+
+`--by model` uses the `model` in each usage reply. For attempts with no usage, it falls back to the pool in the profile name (`<fleet>-<pool>-<n>`), read through `models.toml`.
+
+Example:
+
+```text
+model    tasks  done  success  p50 work  attempts/task  escalated  tokens in/out   cost    cost/done
+haiku      120    96     80%      4m          1.3          18 → ↑     21M / 0.9M   $31.20    $0.33*
+sonnet      60    58     97%      7m          1.1           1 → ↑     44M / 2.1M  $164.10    $2.83
+opus        12    12    100%     15m          1.0           0         19M / 1.2M  $298.50   $24.88
+* includes the cost of 18 escalated retries on sonnet
+```
+
+### 18.4 Live metrics
+
+- **The daemon** serves `GET /metrics` in Prometheus text format, behind the same token (10). It holds only what the daemon knows:
+  - Tasks by state per channel.
+  - Claims, settles and lease expiries, as counters.
+  - Write latency and commit size, as histograms.
+  - Open waiters and streams.
+  - The log head, idempotency hits, and the WAL size.
+
+  No model or cost data: the daemon knows nothing of models.
+- **The fleet supervisor** (16) serves its own `/metrics` on its control socket, or on a local port if configured. It holds:
+  - Workers busy and idle per pool.
+  - Restarts and crash loops.
+  - Unmatched tasks.
+  - Tokens and cost per pool and model, totalled from the usage it sees.
+- Dashboards and alerts are left to whatever the person already runs, such as Grafana. Cork ships one example dashboard file and no alerting of its own.
+
+### 18.5 Tracing, later and optional
+
+When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, wrappers and the supervisor emit OpenTelemetry spans:
+
+- **One trace per task**, with its trace id derived from the task id. So a task's spans join up across attempts, machines and escalations, and a retry's trace links to its `retry_of`.
+- **One span per attempt**, carrying the claim id, profile, pool, model, exit code and usage.
+- **Child spans** for renew calls, and for the agent's own spans if the agent supports trace context. The wrapper passes `TRACEPARENT` to the command.
+- **The daemon** joins in by reading `traceparent` on requests and adding spans for the write transaction and waits.
+
+The log stays the source of truth. Traces are for following one task across systems, not for counting.
+
+### 18.6 Privacy
+
+- Usage replies hold numbers, model names and timings, never prompts, code or output.
+- `cork stats` never prints message text unless asked with `--reasons`, which shows grouped failure reasons.
+- `/metrics` uses channel names as labels. Server mode (13) can turn that off for boards where channel names are sensitive.
+
+### 18.7 Done when (for Milestone 3)
+
+1. **Flow from replay:** for a scripted run with known timings, every metric in 18.1 from `cork stats` matches the script within 1 ms. The same numbers come back after `export` and `serve --import`.
+2. **Usage capture:** a fake agent that writes `$CORK_USAGE`, and a recorded Claude Code JSON output, each produce one `usage=attempt` reply per attempt with the right fields, for completed, failed, blocked and max-runtime runs. A broken usage file changes nothing about settling.
+3. **Cost per successful task:** a scripted escalation chain (haiku fails, sonnet completes) is charged in full to haiku as the starting model, and shown split by finishing model.
+4. **Unknown usage:** an attempt killed with `kill -9` is counted, and shown as unknown usage, not zero.
+5. **`/metrics`:** the daemon's counters match the log after a stress run (`cork-stress` checks them alongside its invariants). Scraping adds no measurable write latency.
+6. **No core change:** everything except `/metrics` runs against an unmodified Milestone 2 daemon.
+7. **A real report:** the measured runs of 17.5 are re-read with `cork stats`, and the write-up in `docs/` shows cost per successful task by model for each setup.
