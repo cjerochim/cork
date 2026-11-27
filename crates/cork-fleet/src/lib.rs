@@ -7,6 +7,7 @@
 pub mod catalog;
 pub mod config;
 pub mod routing;
+pub mod supervisor;
 
 pub use catalog::{Catalog, Model, Needs, UnknownKeyword};
 pub use config::{Fleet, Pool};

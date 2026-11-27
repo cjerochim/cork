@@ -147,8 +147,60 @@ struct FleetFiles {
     config: Option<PathBuf>,
 }
 
+/// Which running fleet a control command talks to.
+#[derive(Args, Clone)]
+struct FleetPick {
+    /// The fleet's name. Defaults to the one in the fleet config, or the
+    /// only fleet running.
+    #[arg(long)]
+    fleet: Option<String>,
+    /// The fleet config, to read the fleet's name from.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum WorkersCmd {
+    /// Start the fleet: foreground by default.
+    Up {
+        /// The fleet config (workers.toml, or .json).
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        /// Run in the background, logging to <home>/workers/<fleet>.log.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Pools, sizes, busy and idle workers, restarts and unmatched tasks.
+    Status {
+        #[command(flatten)]
+        pick: FleetPick,
+    },
+    /// Resize a running pool: n, +n or -n, within its min and max.
+    Scale {
+        pool: String,
+        #[arg(allow_hyphen_values = true)]
+        count: String,
+        #[command(flatten)]
+        pick: FleetPick,
+    },
+    /// Let the pool's workers finish their tasks, then stop them.
+    Drain {
+        pool: String,
+        #[command(flatten)]
+        pick: FleetPick,
+    },
+    /// Re-read both files and apply count, model and command changes.
+    Reload {
+        #[command(flatten)]
+        pick: FleetPick,
+    },
+    /// Drain everything and stop; with --now, release every task and stop.
+    Down {
+        #[arg(long)]
+        now: bool,
+        #[command(flatten)]
+        pick: FleetPick,
+    },
     /// The keyword vocabulary, its aliases, and which models cover each one.
     Keywords {
         #[command(flatten)]
@@ -433,6 +485,41 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
             return Ok(1);
         }
         Cmd::Workers {
+            cmd: WorkersCmd::Up { config, detach },
+        } => return workers::up(&home, config.as_deref(), *detach).await,
+        Cmd::Workers {
+            cmd:
+                c @ (WorkersCmd::Status { .. }
+                | WorkersCmd::Scale { .. }
+                | WorkersCmd::Drain { .. }
+                | WorkersCmd::Reload { .. }
+                | WorkersCmd::Down { .. }),
+        } => {
+            let (pick, req) = match c {
+                WorkersCmd::Status { pick } => (pick, serde_json::json!({"op": "status"})),
+                WorkersCmd::Scale { pool, count, pick } => (
+                    pick,
+                    serde_json::json!({"op": "scale", "pool": pool, "count": count}),
+                ),
+                WorkersCmd::Drain { pool, pick } => {
+                    (pick, serde_json::json!({"op": "drain", "pool": pool}))
+                }
+                WorkersCmd::Reload { pick } => (pick, serde_json::json!({"op": "reload"})),
+                WorkersCmd::Down { now, pick } => {
+                    (pick, serde_json::json!({"op": "down", "now": now}))
+                }
+                _ => unreachable!(),
+            };
+            return workers::control(
+                &home,
+                pick.fleet.as_deref(),
+                pick.config.as_deref(),
+                req,
+                cli.json,
+            )
+            .await;
+        }
+        Cmd::Workers {
             cmd: WorkersCmd::Keywords { files },
         } => {
             let l = workers::load(&home, files.models.as_deref(), files.config.as_deref())?;
@@ -464,7 +551,15 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
             cmd: DebugCmd::Rebuild { .. },
         }
         | Cmd::Workers {
-            cmd: WorkersCmd::Keywords { .. } | WorkersCmd::Match { task_id: None, .. },
+            cmd:
+                WorkersCmd::Keywords { .. }
+                | WorkersCmd::Match { task_id: None, .. }
+                | WorkersCmd::Up { .. }
+                | WorkersCmd::Status { .. }
+                | WorkersCmd::Scale { .. }
+                | WorkersCmd::Drain { .. }
+                | WorkersCmd::Reload { .. }
+                | WorkersCmd::Down { .. },
         } => unreachable!(),
         Cmd::Workers {
             cmd:
@@ -1039,7 +1134,7 @@ async fn unclaimed(
 
 // ---------- output ----------
 
-fn print_json(v: &Value) {
+pub(crate) fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
 

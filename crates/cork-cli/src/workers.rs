@@ -263,3 +263,219 @@ pub async fn matches(
     // 3 means nothing can take it, like `nothing_ready`.
     Ok(if any { 0 } else { 3 })
 }
+
+// ---------- the running fleet ----------
+
+/// `cork workers up`: run the supervisor here, or in the background.
+pub async fn up(home: &Path, config: Option<&Path>, detach: bool) -> Result<i32, ClientError> {
+    let path = find_config(home, config).ok_or_else(|| {
+        usage(format!(
+            "no fleet config: pass --config FILE, set CORK_WORKERS, or write {}",
+            home.join("workers.toml").display()
+        ))
+    })?;
+    let path =
+        std::fs::canonicalize(&path).map_err(|e| usage(format!("{}: {e}", path.display())))?;
+    let fleet = Fleet::load(&path).map_err(usage)?;
+    let exe = std::env::current_exe().map_err(|e| ClientError::new("internal", e.to_string()))?;
+    let sock = cork_fleet::supervisor::socket_path(home, &fleet.name);
+    if detach {
+        let dir = home.join("workers");
+        std::fs::create_dir_all(&dir).map_err(|e| ClientError::new("internal", e.to_string()))?;
+        let log_path = dir.join(format!("{}.log", fleet.name));
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| ClientError::new("internal", e.to_string()))?;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["workers", "up", "--config"])
+            .arg(&path)
+            .env("CORK_HOME", home)
+            .stdin(std::process::Stdio::null())
+            .stdout(
+                log.try_clone()
+                    .map_err(|e| ClientError::new("internal", e.to_string()))?,
+            )
+            .stderr(log);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd
+            .spawn()
+            .map_err(|e| ClientError::new("internal", e.to_string()))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if cork_fleet::supervisor::call(&sock, &json!({"op": "status"}))
+                .await
+                .is_ok()
+            {
+                println!(
+                    "fleet {} running as pid {}; log {}",
+                    fleet.name,
+                    child.id(),
+                    log_path.display()
+                );
+                return Ok(0);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        return Err(ClientError::new(
+            "internal",
+            format!(
+                "the fleet did not start within 10 s; see {}",
+                log_path.display()
+            ),
+        ));
+    }
+    let conn = cork_client::home::Connect::from_env(Some(fleet.name.clone()));
+    cork_fleet::supervisor::run(cork_fleet::supervisor::Options {
+        fleet,
+        cork_exe: exe,
+        conn,
+        home: home.to_path_buf(),
+    })
+    .await
+    .map_err(|e| ClientError::new("internal", e))
+}
+
+/// Which fleet's socket to talk to: `--fleet`, else the config's name, else
+/// the only socket there is.
+fn pick_socket(
+    home: &Path,
+    fleet: Option<&str>,
+    config: Option<&Path>,
+) -> Result<PathBuf, ClientError> {
+    if let Some(f) = fleet {
+        return Ok(cork_fleet::supervisor::socket_path(home, f));
+    }
+    if let Some(p) = find_config(home, config) {
+        let f = Fleet::load(&p).map_err(usage)?;
+        return Ok(cork_fleet::supervisor::socket_path(home, &f.name));
+    }
+    let dir = home.join("workers");
+    let socks: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|r| {
+            r.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "sock"))
+                .collect()
+        })
+        .unwrap_or_default();
+    match socks.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(usage(
+            "no fleet is running here; start one with `cork workers up`",
+        )),
+        _ => Err(usage("more than one fleet is running; pass --fleet NAME")),
+    }
+}
+
+pub async fn control(
+    home: &Path,
+    fleet: Option<&str>,
+    config: Option<&Path>,
+    req: Value,
+    json_out: bool,
+) -> Result<i32, ClientError> {
+    let sock = pick_socket(home, fleet, config)?;
+    let v = cork_fleet::supervisor::call(&sock, &req)
+        .await
+        .map_err(|e| ClientError::new("transport", e))?;
+    if json_out {
+        crate::print_json(&v);
+    } else if v["ok"] != true {
+        // Printed by the caller's error path.
+    } else if req["op"] == "status" {
+        print_status(&v);
+    } else {
+        println!("{}", v["message"].as_str().unwrap_or("ok"));
+    }
+    if v["ok"] == true {
+        Ok(0)
+    } else {
+        Err(usage(v["error"].as_str().unwrap_or("the fleet refused")))
+    }
+}
+
+fn print_status(v: &Value) {
+    let down = match v["shutting_down"].as_str() {
+        Some(s) => format!(", shutting down ({s})"),
+        None => String::new(),
+    };
+    println!(
+        "fleet {} as {}, up {} s{down}",
+        v["fleet"].as_str().unwrap_or(""),
+        v["person"].as_str().unwrap_or(""),
+        v["up_secs"]
+    );
+    for p in v["pools"].as_array().into_iter().flatten() {
+        let mut flags = vec![];
+        if p["paused"] == true {
+            flags.push(format!(
+                "PAUSED: {}",
+                p["last_error"].as_str().unwrap_or("")
+            ));
+        }
+        if p["removed"] == true {
+            flags.push("removed".into());
+        }
+        if p["autoscale"] == true {
+            flags.push("autoscale".into());
+        }
+        let flags = if flags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", flags.join("; "))
+        };
+        println!(
+            "pool {} ({}, tier {}) on {}: {}/{} workers (min {}, max {}), {} busy, {} idle, {} draining, {} restarts{flags}",
+            p["pool"].as_str().unwrap_or(""),
+            p["model"].as_str().unwrap_or(""),
+            p["tier"],
+            p["select"].as_str().unwrap_or(""),
+            p["live"],
+            p["target"],
+            p["min"],
+            p["max"],
+            p["busy"],
+            p["idle"],
+            p["draining"],
+            p["restarts"],
+        );
+        for w in p["workers"].as_array().into_iter().flatten() {
+            let what = match w["task"].as_str() {
+                Some(t) => format!("on {t}"),
+                None if w["backing_off"] == true => "backing off".into(),
+                None => "idle".into(),
+            };
+            let d = if w["draining"] == true {
+                " (draining)"
+            } else {
+                ""
+            };
+            println!("  {}\t{what}{d}", w["profile"].as_str().unwrap_or(""));
+        }
+    }
+    let un = v["unmatched"].as_array().cloned().unwrap_or_default();
+    if !un.is_empty() {
+        println!("unmatched: {} ready tasks no pool covers", un.len());
+        for u in un {
+            let needs: Vec<String> = u["needs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(u["unknown"].as_array().into_iter().flatten())
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect();
+            println!(
+                "  {} in {} needs {}",
+                u["task"].as_str().unwrap_or(""),
+                u["channel"].as_str().unwrap_or(""),
+                needs.join(", ")
+            );
+        }
+    }
+}
