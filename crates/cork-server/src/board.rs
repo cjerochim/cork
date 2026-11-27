@@ -347,6 +347,32 @@ impl Batch {
         Ok(after)
     }
 
+    /// What each dependency of `task` passes on to it (Decision 2): its
+    /// head's latest result, with the head's text, time and holder.
+    fn dependency_results(
+        &self,
+        tx: &mut dyn WriteTx,
+        task: &Task,
+    ) -> Result<Vec<DependencyResult>> {
+        let mut out = Vec::with_capacity(task.depends_on.len());
+        for d in &task.depends_on {
+            let head = deps::head(&mut self.look(tx), d)?;
+            let text = self
+                .message(tx, &head.id)?
+                .map(|m| clip(&m.text, DEPENDENCY_TEXT_MAX))
+                .unwrap_or_default();
+            out.push(DependencyResult {
+                task_id: d.clone(),
+                head: head.id.clone(),
+                text,
+                result: head.result.clone(),
+                completed_at: head.completed_at,
+                holder: head.completed_by.clone(),
+            });
+        }
+        Ok(out)
+    }
+
     /// Apply the dependency rule for every settle in this batch, in order:
     /// ready the dependents whose last dependency just completed, and tell
     /// waiting dependents when one failed (6.8.5, Decision 1). Runs at the
@@ -427,7 +453,8 @@ impl Batch {
             let d = task.claim(self.now, &waiter.holder, new_id(), waiter.lease_ms)?;
             let after = self.task(Some(&task), &d.events, &waiter.holder)?;
             let root = self.message(tx, &after.id)?;
-            let out = claimed(&after, root, self.now);
+            let results = self.dependency_results(tx, &after)?;
+            let out = claimed(&after, root, self.now, results);
             if let Some(idem) = &waiter.idem {
                 let v = serde_json::to_value(&out).map_err(json_err)?;
                 self.remember(&waiter.holder.person, idem, v);
@@ -451,9 +478,15 @@ pub fn new_id() -> String {
     ulid::Ulid::new().to_string()
 }
 
-fn claimed(task: &Task, root: Option<Message>, now: Millis) -> ClaimOut {
+fn claimed(
+    task: &Task,
+    root: Option<Message>,
+    now: Millis,
+    dependencies: Vec<DependencyResult>,
+) -> ClaimOut {
     let c = task.claim.as_ref();
     ClaimOut {
+        dependencies,
         outcome: ClaimOutcome::Claimed,
         claim_id: c.map(|c| c.claim_id.clone()),
         expires_at: c.map(|c| c.expires_at),
@@ -505,6 +538,136 @@ pub fn event_out(e: &StoredEvent) -> EventOut {
 enum ClaimStep {
     Done(serde_json::Value),
     Wait(WaiterGuard, oneshot::Receiver<ClaimOut>),
+}
+
+/// Create one task inside a write: its root, its `TaskCreated`, and, for a
+/// retry, `TaskReplaced` on the task it takes over (6.8.3).
+fn create_in(
+    tx: &mut dyn WriteTx,
+    b: &mut Batch,
+    actor: &Actor,
+    req: CreateTaskReq,
+) -> Result<TaskOut> {
+    let mut root = post_root(
+        new_id(),
+        &req.channel,
+        NewMessage {
+            text: req.text,
+            labels: req.labels,
+            data: req.data,
+        },
+        actor.clone(),
+        b.now,
+    )?;
+    let resolved = deps::resolve_create(&mut b.look(tx), &req.depends_on, req.replaces.as_deref())?;
+    let replaced = match &req.replaces {
+        Some(old) => {
+            let old = b.load(tx, old)?;
+            let chain = deps::chain_len(&mut b.look(tx), &old.id)?;
+            let d = old.replace(b.now, actor, &root.id, chain)?;
+            Some((old, d))
+        }
+        None => None,
+    };
+    let created = Task::create_with(
+        root.id.clone(),
+        &root.channel,
+        actor,
+        root.labels.clone(),
+        &CreateTask {
+            lease_ms: req.lease_ms,
+            max_attempts: req.max_attempts,
+            assignee: req.assignee,
+        },
+        resolved,
+    )?;
+    let position = b.post(&root);
+    let task = b.task(None, &[created], actor)?;
+    if let Some((old, d)) = replaced {
+        b.task(Some(&old), &d.events, actor)?;
+    }
+    root.labels
+        .insert(TASK_LABEL.into(), task.state.as_str().into());
+    let view = deps::view(&mut b.look(tx), &task, b.now)?;
+    Ok(TaskOut {
+        stuck: deps::is_stuck(task.state, &view),
+        dependencies: view.iter().map(dependency_out).collect(),
+        dependents: vec![],
+        task,
+        root: MessageOut {
+            position,
+            message: root,
+        },
+        now: b.now,
+    })
+}
+
+/// The order to create a plan's tasks in: each after the plan tasks it
+/// waits for, otherwise as written. Keys must be unique and form no cycle;
+/// that is the only cycle check (6.8.9).
+fn plan_order(req: &PlanReq) -> Result<Vec<usize>> {
+    if req.tasks.is_empty() {
+        return Err(BoardError::invalid("a plan needs at least one task"));
+    }
+    if req.tasks.len() > PLAN_MAX_TASKS {
+        return Err(BoardError::invalid(format!(
+            "a plan may hold at most {PLAN_MAX_TASKS} tasks"
+        )));
+    }
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for (i, t) in req.tasks.iter().enumerate() {
+        if t.key.trim().is_empty() {
+            return Err(BoardError::invalid(format!(
+                "plan task {} has no key",
+                i + 1
+            )));
+        }
+        if !t.needs.is_empty() {
+            return Err(BoardError::invalid(format!(
+                "plan task `{}`: `needs` is turned into labels by the client (cork tasks create --file)",
+                t.key
+            )));
+        }
+        if index.insert(t.key.as_str(), i).is_some() {
+            return Err(BoardError::invalid(format!(
+                "plan key `{}` is used twice",
+                t.key
+            )));
+        }
+    }
+    let mut order = Vec::with_capacity(req.tasks.len());
+    let mut done = vec![false; req.tasks.len()];
+    while order.len() < req.tasks.len() {
+        let before = order.len();
+        for (i, t) in req.tasks.iter().enumerate() {
+            if done[i] {
+                continue;
+            }
+            let ready = t
+                .after
+                .iter()
+                .all(|a| index.get(a.as_str()).is_none_or(|&j| done[j]));
+            if ready {
+                done[i] = true;
+                order.push(i);
+            }
+        }
+        if order.len() == before {
+            let mut cycle: Vec<&str> = req
+                .tasks
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !done[*i])
+                .map(|(_, t)| t.key.as_str())
+                .collect();
+            cycle.sort();
+            return Err(BoardError::invalid(format!(
+                "plan keys form a cycle: {}",
+                cycle.join(", ")
+            )));
+        }
+    }
+    Ok(order)
 }
 
 // ---------- the board ----------
@@ -750,55 +913,61 @@ impl<S: Store> Board<S> {
         req: CreateTaskReq,
     ) -> Result<serde_json::Value> {
         let actor = caller.actor.clone();
+        self.write_idem(caller, idem, move |tx, b| create_in(tx, b, &actor, req))
+            .await
+    }
+
+    /// `POST /tasks/plan`: many tasks and how they relate, in one commit
+    /// (6.8.8). `after` names keys in the plan or ids of existing tasks.
+    pub async fn create_plan(
+        &self,
+        caller: &Caller,
+        idem: Option<Idem>,
+        req: PlanReq,
+    ) -> Result<serde_json::Value> {
+        let actor = caller.actor.clone();
+        let order = plan_order(&req)?;
         self.write_idem(caller, idem, move |tx, b| {
-            let mut root = post_root(
-                new_id(),
-                &req.channel,
-                NewMessage {
-                    text: req.text,
-                    labels: req.labels,
-                    data: req.data,
-                },
-                actor.clone(),
-                b.now,
-            )?;
-            let resolved =
-                deps::resolve_create(&mut b.look(tx), &req.depends_on, req.replaces.as_deref())?;
-            // A retry takes its old task's place in the same commit (6.8.3).
-            let replaced = match &req.replaces {
-                Some(old) => {
-                    let old = b.load(tx, old)?;
-                    let chain = deps::chain_len(&mut b.look(tx), &old.id)?;
-                    let d = old.replace(b.now, &actor, &root.id, chain)?;
-                    Some((old, d))
-                }
-                None => None,
-            };
-            let created = Task::create_with(
-                root.id.clone(),
-                &root.channel,
-                &actor,
-                root.labels.clone(),
-                &CreateTask {
-                    lease_ms: req.lease_ms,
-                    max_attempts: req.max_attempts,
-                    assignee: req.assignee,
-                },
-                resolved,
-            )?;
-            let position = b.post(&root);
-            let task = b.task(None, &[created], &actor)?;
-            if let Some((old, d)) = replaced {
-                b.task(Some(&old), &d.events, &actor)?;
+            let mut ids: HashMap<String, String> = HashMap::new();
+            let mut out: Vec<Option<PlannedTask>> = vec![None; req.tasks.len()];
+            let mut tasks: Vec<Option<PlanTask>> = req.tasks.into_iter().map(Some).collect();
+            for i in order {
+                let t = tasks[i].take().expect("each task is created once");
+                let depends_on = t
+                    .after
+                    .iter()
+                    .map(|a| ids.get(a).cloned().unwrap_or_else(|| a.clone()))
+                    .collect();
+                let channel = t.channel.or_else(|| req.channel.clone()).ok_or_else(|| {
+                    BoardError::invalid(format!("plan task `{}` has no channel", t.key))
+                })?;
+                let created = create_in(
+                    tx,
+                    b,
+                    &actor,
+                    CreateTaskReq {
+                        channel,
+                        text: t.text,
+                        labels: t.labels,
+                        data: t.data,
+                        lease_ms: t.lease_ms,
+                        max_attempts: t.max_attempts,
+                        assignee: t.assignee,
+                        depends_on,
+                        replaces: None,
+                    },
+                )
+                .map_err(|e| {
+                    BoardError::new(e.code, format!("plan task `{}`: {}", t.key, e.message))
+                })?;
+                ids.insert(t.key.clone(), created.task.id.clone());
+                out[i] = Some(PlannedTask {
+                    key: t.key,
+                    task: created,
+                });
             }
-            root.labels
-                .insert(TASK_LABEL.into(), task.state.as_str().into());
-            Ok(TaskOut {
-                task,
-                root: MessageOut {
-                    position,
-                    message: root,
-                },
+            Ok(PlanOut {
+                tasks: out.into_iter().flatten().collect(),
                 now: b.now,
             })
         })
@@ -827,7 +996,8 @@ impl<S: Store> Board<S> {
                     let d = task.claim(b.now, &holder, new_id(), lease)?;
                     let after = b.task(Some(&task), &d.events, &holder)?;
                     let root = b.message(tx, &after.id)?;
-                    Ok(claimed(&after, root, b.now))
+                    let results = b.dependency_results(tx, &after)?;
+                    Ok(claimed(&after, root, b.now, results))
                 })
                 .await;
         }
@@ -867,7 +1037,9 @@ impl<S: Store> Board<S> {
                     let d = st.task.claim(b.now, &holder, new_id(), lease)?;
                     let after = b.task(Some(&st.task), &d.events, &holder)?;
                     let root = b.message(tx, &after.id)?;
-                    let v = serde_json::to_value(claimed(&after, root, b.now)).map_err(json_err)?;
+                    let results = b.dependency_results(tx, &after)?;
+                    let v = serde_json::to_value(claimed(&after, root, b.now, results))
+                        .map_err(json_err)?;
                     if let Some(idem) = &idem {
                         b.remember(&person, idem, v.clone());
                     }
@@ -1227,7 +1399,79 @@ impl<S: Store> Board<S> {
             .root_out(id, now)
             .await?
             .ok_or_else(|| BoardError::not_found(format!("task {id}")))?;
-        Ok(TaskOut { task, root, now })
+        let view = self.dependency_view(&task, now).await?;
+        let stuck = deps::is_stuck(task.state, &view);
+        let dependents = self.dependents_of(&task.id, now).await?;
+        Ok(TaskOut {
+            dependencies: view.iter().map(dependency_out).collect(),
+            stuck,
+            dependents,
+            task,
+            root,
+            now,
+        })
+    }
+
+    // ---------- dependency reads (6.8.7) ----------
+
+    async fn stored(&self, id: &str) -> Result<Task> {
+        self.store
+            .get_task(id)
+            .await?
+            .map(|t| t.task)
+            .ok_or_else(|| BoardError::not_found(format!("task {id}")))
+    }
+
+    /// The newest task in `id`'s replacement chain.
+    async fn head_of(&self, id: &str) -> Result<Task> {
+        let mut t = self.stored(id).await?;
+        for _ in 0..=deps::MAX_REPLACEMENTS {
+            match t.replaced_by.clone() {
+                Some(next) => t = self.stored(&next).await?,
+                None => return Ok(t),
+            }
+        }
+        Err(BoardError::internal(format!(
+            "replacement chain from {id} is too long"
+        )))
+    }
+
+    /// Each dependency of `task` with its head and the head's state at `now`.
+    async fn dependency_view(&self, task: &Task, now: Millis) -> Result<Vec<deps::DependencyView>> {
+        let mut out = vec![];
+        for d in &task.depends_on {
+            let head = self.head_of(d).await?;
+            out.push(deps::DependencyView {
+                declared: d.clone(),
+                state: head.effective_state(now),
+                head,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Tasks with a dependency that resolves to `id`, oldest first. An id
+    /// that was replaced resolves to its head first.
+    async fn dependents_of(&self, id: &str, now: Millis) -> Result<Vec<DependentOut>> {
+        let head = self.head_of(id).await?;
+        let mut chain = vec![head.id.clone()];
+        let mut t = head.clone();
+        while let Some(prev) = t.replaces.clone() {
+            if chain.len() > deps::MAX_REPLACEMENTS {
+                break;
+            }
+            t = self.stored(&prev).await?;
+            chain.push(prev);
+        }
+        let mut out = vec![];
+        for dep in self.store.dependents(&chain).await? {
+            let t = self.stored(&dep).await?;
+            out.push(DependentOut {
+                task_id: t.id.clone(),
+                state: t.effective_state(now),
+            });
+        }
+        Ok(out)
     }
 
     async fn history_events(&self, id: &str) -> Result<Vec<StoredEvent>> {
@@ -1264,20 +1508,77 @@ impl<S: Store> Board<S> {
         })
     }
 
-    pub async fn tasks(&self, mut q: TaskQuery) -> Result<TasksPage> {
+    /// `GET /tasks`. `waiting_on` keeps the tasks with a dependency that
+    /// resolves to that task; `stuck` keeps stuck tasks (6.8.7).
+    pub async fn tasks(
+        &self,
+        mut q: TaskQuery,
+        waiting_on: Option<String>,
+        stuck_only: bool,
+    ) -> Result<TasksPage> {
         q.now = self.now();
         q.limit = page(q.limit, EVENTS_PAGE, EVENTS_PAGE_MAX);
-        Ok(TasksPage {
-            tasks: self
-                .store
-                .list_tasks(&q)
-                .await?
-                .into_iter()
-                .map(|t| TaskListItem {
+        if stuck_only {
+            match q.state {
+                None | Some(TaskState::Waiting) => q.state = Some(TaskState::Waiting),
+                Some(_) => {
+                    return Ok(TasksPage {
+                        tasks: vec![],
+                        now: q.now,
+                    });
+                }
+            }
+        }
+        let filtered = waiting_on.is_some() || stuck_only;
+        let wanted: Option<std::collections::HashSet<String>> = match &waiting_on {
+            Some(id) => Some(
+                self.dependents_of(id, q.now)
+                    .await?
+                    .into_iter()
+                    .map(|d| d.task_id)
+                    .collect(),
+            ),
+            None => None,
+        };
+        let limit = q.limit;
+        let mut out = vec![];
+        loop {
+            // With a filter on top, read full pages and keep what matches.
+            if filtered {
+                q.limit = EVENTS_PAGE_MAX;
+            }
+            let page = self.store.list_tasks(&q).await?;
+            let n = page.len();
+            for t in page {
+                q.after = t.created_position;
+                if wanted.as_ref().is_some_and(|w| !w.contains(&t.task.id)) {
+                    continue;
+                }
+                let task = t.task.at(q.now);
+                let stuck = if task.state == TaskState::Waiting {
+                    let view = self.dependency_view(&task, q.now).await?;
+                    deps::is_stuck(task.state, &view)
+                } else {
+                    false
+                };
+                if stuck_only && !stuck {
+                    continue;
+                }
+                out.push(TaskListItem {
                     created_position: t.created_position,
-                    task: t.task.at(q.now),
-                })
-                .collect(),
+                    task,
+                    stuck,
+                });
+                if out.len() >= limit {
+                    break;
+                }
+            }
+            if !filtered || out.len() >= limit || n < q.limit {
+                break;
+            }
+        }
+        Ok(TasksPage {
+            tasks: out,
             now: q.now,
         })
     }
@@ -1452,6 +1753,24 @@ impl<S: Store> Drop for StreamSlot<S> {
     fn drop(&mut self) {
         self.0.streams.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+fn dependency_out(v: &deps::DependencyView) -> DependencyOut {
+    DependencyOut {
+        task_id: v.declared.clone(),
+        head: v.head.id.clone(),
+        state: v.state,
+        completed_at: v.head.completed_at,
+    }
+}
+
+/// At most `max` bytes of `s`, cut on a character boundary.
+fn clip(s: &str, max: usize) -> String {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 fn handoff_lost() -> BoardError {

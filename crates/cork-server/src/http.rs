@@ -117,6 +117,7 @@ pub fn router<S: Store>(app: AppState<S>) -> Router {
         .route("/events/stream", get(stream::<S>))
         .route("/tasks", post(create_task::<S>).get(list_tasks::<S>))
         .route("/tasks/claim", post(claim::<S>))
+        .route("/tasks/plan", post(create_plan::<S>))
         .route("/tasks/{id}", get(get_task::<S>))
         .route("/tasks/{id}/history", get(history::<S>))
         .route("/tasks/{id}/{op}", post(settle::<S>))
@@ -516,6 +517,19 @@ async fn create_task<S: Store>(
     Ok(Json(app.board.create_task(&w.caller, w.idem, req).await?))
 }
 
+async fn create_plan<S: Store>(
+    State(app): State<AppState<S>>,
+    Extension(c): Extension<Caller>,
+    method: Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    let w = write_req(c, &method, uri.path(), &headers, raw)?;
+    let req: PlanReq = body(&w.body)?;
+    Ok(Json(app.board.create_plan(&w.caller, w.idem, req).await?))
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct TasksQ {
     channel: Option<String>,
@@ -527,6 +541,9 @@ struct TasksQ {
     after: u64,
     #[serde(default)]
     limit: usize,
+    waiting_on: Option<String>,
+    #[serde(default)]
+    stuck: bool,
 }
 
 async fn list_tasks<S: Store>(
@@ -537,16 +554,20 @@ async fn list_tasks<S: Store>(
     let state: Option<TaskState> = q.state.as_deref().map(parse_state).transpose()?;
     let page = app
         .board
-        .tasks(TaskQuery {
-            channel: selector(&q.channel)?,
-            state,
-            labels: parse_filter(&q.label)?,
-            owner: q.owner,
-            claimable_by: None,
-            after: q.after,
-            limit: q.limit,
-            now: 0,
-        })
+        .tasks(
+            TaskQuery {
+                channel: selector(&q.channel)?,
+                state,
+                labels: parse_filter(&q.label)?,
+                owner: q.owner,
+                claimable_by: None,
+                after: q.after,
+                limit: q.limit,
+                now: 0,
+            },
+            q.waiting_on,
+            q.stuck,
+        )
         .await?;
     Ok(with_head(head, page))
 }

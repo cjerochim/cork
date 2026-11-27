@@ -128,6 +128,8 @@ pub struct IdempotencyRecord {
 }
 
 /// A projection row written in the same transaction as the events.
+// A `Task` is the big one; a commit holds a handful, so boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Projection {
     /// Insert a message. Its position is that of the last event this commit

@@ -46,8 +46,25 @@ cork --idempotency-key "$F-1" tasks create work "<full task text>" \
   the work they can do. `cork workers keywords` lists the vocabulary. An
   unknown keyword is refused with a suggestion: fix it, never drop it.
 - **Keys:** `<feature>-<n>`, numbered in plan order. Reuse them on resume.
-- **Order:** if a child depends on another, say so in its text and create
-  it after the first one completes.
+- **Order:** declare it, and let the board run it. Write the children as one
+  plan file, where a child names the ones it waits for by key in `after`.
+  Children with no `after` start at once on cheap pools. The board readies
+  each waiting child when its last dependency completes, and hands it their
+  results. Create the plan once, under the feature's key; resending it is a
+  no-op:
+
+  ```bash
+  cat > plan.json <<JSON
+  { "idempotency_key": "$F-plan-1",
+    "tasks": [
+      { "key": "schema",   "text": "<full text>", "needs": ["typescript"], "labels": { "parent": "$F" } },
+      { "key": "importer", "text": "<full text>", "after": ["schema"],     "labels": { "parent": "$F" } },
+      { "key": "docs",     "text": "<full text>", "after": ["importer"],   "labels": { "parent": "$F" } } ] }
+  JSON
+  cork --json tasks create work --file plan.json
+  ```
+
+  A waiting child is never offered to a worker, and you never move one by hand.
 - At most `max_children` children (default 20).
 
 ## 2. Watch
@@ -56,8 +73,14 @@ Never poll. Wait on any child's change:
 
 ```bash
 cork --json wait work/ --label parent="$F" \
-  --type TaskCompleted --type TaskFailed --type TaskBlocked --type LeaseExpired --timeout 30m
+  --type TaskCompleted --type TaskFailed --type TaskBlocked --type LeaseExpired \
+  --type DependencyFailed --timeout 30m
 ```
+
+`DependencyFailed` means a child's dependency failed: the child stays
+waiting and shows as stuck (`cork tasks list --stuck`) until you escalate or
+reopen that dependency, or cancel the child. You need not watch
+`DependenciesMet`: workers pick those children up.
 
 Then roll up: `cork tasks list --label parent="$F"`. Post the rollup
 ("5 completed, 1 claimed, 1 blocked") in the feature's thread when it changes
@@ -94,10 +117,13 @@ cork --json tasks escalate <id> --needs large-context        # add what it was m
 `tasks escalate` creates the retry with the old needs plus the next tier,
 `retry_of=<old>`, your `parent` label, and a text that names the old branch
 (`cork/<old>/<attempt>`), the failure and the progress notes, so the stronger
-model can continue from there. It cancels the old task if nobody holds it, and
-links the two threads. It is safe to re-run after a crash: it never makes a
-second retry. It exits 3 when there is no stronger tier, when no model covers
-the needs, or after 2 escalations of the same work.
+model can continue from there. The retry declares that it **replaces** the
+old task: the board ends the old one, links both ways (`cork tasks show`),
+and every child waiting on the old one now waits on the retry. Do not cancel,
+link or edit anything yourself. It is safe to re-run after a crash: it never
+makes a second retry. It exits 3 while a worker holds the old task or once it
+completed, when there is no stronger tier, when no model covers the needs, or
+after 2 escalations of the same work.
 
 ## 5. Raise issues to the person
 

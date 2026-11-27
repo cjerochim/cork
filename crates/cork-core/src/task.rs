@@ -299,6 +299,12 @@ pub struct Task {
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// When the latest `TaskCompleted` was written, and whose claim wrote it
+    /// (passed on to dependents, 6.8.10 Decision 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Millis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_by: Option<Actor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -428,6 +434,8 @@ impl Task {
                 claim: None,
                 attempts: 0,
                 result: None,
+                completed_at: None,
+                completed_by: None,
                 reason: None,
                 question: None,
                 last_settle: None,
@@ -492,6 +500,8 @@ impl Task {
                 self.attempts = self.attempts.saturating_sub(1);
             }
             TaskEvent::TaskCompleted { claim_id, result } => {
+                self.completed_by = self.claim.as_ref().map(|c| c.holder.clone());
+                self.completed_at = Some(at);
                 self.settled(claim_id, SettleOp::Complete, at);
                 self.state = TaskState::Completed;
                 self.result = result.clone();
@@ -538,6 +548,8 @@ impl Task {
                 };
                 self.attempts = 0;
                 self.result = None;
+                self.completed_at = None;
+                self.completed_by = None;
                 self.reason = None;
                 self.question = None;
                 self.last_settle = None;

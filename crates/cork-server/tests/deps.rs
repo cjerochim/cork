@@ -525,3 +525,173 @@ async fn projections_follow_the_log() {
             .collect();
     assert_eq!(ids, HashSet::from([b]));
 }
+
+// ---------- part two: reads, results, plans ----------
+
+#[tokio::test]
+async fn show_and_list_dependencies_and_stuck() {
+    let d = Daemon::start().await;
+    let lead = d.client("lead");
+    let w = d.client("w");
+    let a = new_task(&lead, "a", json!({})).await;
+    let c = new_task(&lead, "c", json!({})).await;
+    let b = new_task(&lead, "b", json!({ "depends_on": [a, c] })).await;
+    run(&w, &a, "complete").await;
+    run(&w, &c, "fail").await;
+
+    let t = lead.get(&format!("/tasks/{b}")).await.ok();
+    assert_eq!(t["stuck"], true);
+    assert_eq!(t["dependencies"][0]["task_id"], a);
+    assert_eq!(t["dependencies"][0]["state"], "completed");
+    assert!(t["dependencies"][0]["completed_at"].is_i64());
+    assert_eq!(t["dependencies"][1]["state"], "failed");
+    let ta = lead.get(&format!("/tasks/{a}")).await.ok();
+    assert_eq!(
+        ta["dependents"],
+        json!([{ "task_id": b, "state": "waiting" }])
+    );
+    assert!(ta.get("stuck").is_none(), "false is left out");
+
+    let stuck = lead.get("/tasks?stuck=true").await.ok();
+    assert_eq!(stuck["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(stuck["tasks"][0]["id"], b);
+    assert_eq!(stuck["tasks"][0]["stuck"], true);
+    let on = lead.get(&format!("/tasks?waiting_on={c}")).await.ok();
+    assert_eq!(on["tasks"][0]["id"], b);
+    assert_eq!(
+        lead.get("/tasks?stuck=true&state=ready").await.ok()["tasks"],
+        json!([])
+    );
+
+    // Replace the failed one: no longer stuck, nothing written on b, and
+    // `waiting_on` finds b through the old id and the new one.
+    let c2 = s(&lead
+        .create("work", "c again", json!({ "replaces": c }))
+        .await["task"]["id"]);
+    let t = lead.get(&format!("/tasks/{b}")).await.ok();
+    assert!(t.get("stuck").is_none());
+    assert_eq!(t["dependencies"][1]["task_id"], c);
+    assert_eq!(t["dependencies"][1]["head"], c2);
+    assert_eq!(t["dependencies"][1]["state"], "ready");
+    for id in [&c, &c2] {
+        let on = lead.get(&format!("/tasks?waiting_on={id}")).await.ok();
+        assert_eq!(on["tasks"][0]["id"], b, "waiting_on {id}");
+    }
+    assert_eq!(lead.get("/tasks?stuck=true").await.ok()["tasks"], json!([]));
+}
+
+/// Decision 2: the claim carries each dependency's result.
+#[tokio::test]
+async fn claim_passes_dependency_results() {
+    let d = Daemon::start().await;
+    let lead = d.client("lead");
+    let a = new_task(&lead, &"a".repeat(3000), json!({})).await;
+    let x = new_task(&lead, "x", json!({})).await;
+    let b = new_task(&lead, "b", json!({ "depends_on": [a, x] })).await;
+    run(&d.client("wa"), &a, "complete").await;
+    run(&d.client("wx"), &x, "fail").await;
+    let x2 = s(&lead.create("work", "x2", json!({ "replaces": x })).await["task"]["id"]);
+    run(&d.client("wx2"), &x2, "complete").await;
+
+    let c = d.client("w").claim(json!({ "task_id": b })).await.ok();
+    let deps = c["dependencies"].as_array().unwrap();
+    assert_eq!(deps.len(), 2);
+    assert_eq!(deps[0]["task_id"], a);
+    assert_eq!(deps[0]["head"], a);
+    assert_eq!(deps[0]["text"].as_str().unwrap().len(), 2048, "first 2 KB");
+    assert_eq!(deps[0]["result"], format!("{a} done"));
+    assert_eq!(deps[0]["holder"]["profile"], "wa");
+    assert!(deps[0]["completed_at"].is_i64());
+    assert_eq!(deps[1]["task_id"], x);
+    assert_eq!(deps[1]["head"], x2);
+    assert_eq!(deps[1]["text"], "x2");
+    assert_eq!(deps[1]["holder"]["profile"], "wx2");
+    // A task with no dependencies has none to pass.
+    let e = new_task(&lead, "e", json!({})).await;
+    let c = d.client("w").claim(json!({ "task_id": e })).await.ok();
+    assert!(c.get("dependencies").is_none());
+}
+
+#[tokio::test]
+async fn plans_are_one_commit() {
+    let d = Daemon::start().await;
+    let lead = d.client("lead");
+    let old = new_task(&lead, "existing", json!({})).await;
+    let plan = json!({
+        "channel": "work",
+        "tasks": [
+            { "key": "docs", "text": "Document it", "after": ["schema", old] },
+            { "key": "schema", "text": "Add the column", "labels": { "parent": "F" } },
+            { "key": "tests", "text": "Tests", "after": ["schema"], "channel": "work/qa" }
+        ]
+    });
+    let head = all_events(&lead).await.len();
+    let r = lead
+        .post_key("/tasks/plan", "feature-F-plan-1", plan.clone())
+        .await
+        .ok();
+    let tasks = r["tasks"].as_array().unwrap();
+    assert_eq!(
+        tasks.iter().map(|t| s(&t["key"])).collect::<Vec<_>>(),
+        ["docs", "schema", "tests"],
+        "in file order"
+    );
+    let schema = s(&tasks[1]["task"]["id"]);
+    assert_eq!(tasks[1]["task"]["state"], "ready");
+    assert_eq!(tasks[0]["task"]["state"], "waiting");
+    assert_eq!(tasks[0]["task"]["depends_on"], json!([schema, old]));
+    assert_eq!(tasks[2]["task"]["channel"], "work/qa");
+    // One commit, created in dependency order.
+    let events = all_events(&lead).await;
+    assert_eq!(events.len(), head + 6);
+    assert!(
+        position_of(&events, "TaskCreated", &schema)
+            < position_of(&events, "TaskCreated", &s(&tasks[0]["task"]["id"]))
+    );
+    // Resending is a no-op.
+    let again = lead
+        .post_key("/tasks/plan", "feature-F-plan-1", plan)
+        .await
+        .ok();
+    assert_eq!(again["tasks"], r["tasks"]);
+    assert_eq!(all_events(&lead).await.len(), head + 6);
+
+    // Bad plans write nothing.
+    let n = all_events(&lead).await.len();
+    for (bad, code, says) in [
+        (
+            json!({ "channel": "w", "tasks": [
+            { "key": "a", "text": "a", "after": ["b"] },
+            { "key": "b", "text": "b", "after": ["a"] },
+            { "key": "c", "text": "c" } ] }),
+            "invalid_input",
+            "a, b",
+        ),
+        (
+            json!({ "channel": "w", "tasks": [
+            { "key": "a", "text": "a" }, { "key": "a", "text": "again" } ] }),
+            "invalid_input",
+            "twice",
+        ),
+        (
+            json!({ "channel": "w", "tasks": [
+            { "key": "a", "text": "a" }, { "key": "b", "text": "b", "after": ["nope"] } ] }),
+            "not_found",
+            "plan task `b`",
+        ),
+        (
+            json!({ "channel": "w", "tasks": [] }),
+            "invalid_input",
+            "at least one",
+        ),
+    ] {
+        let r = lead.post("/tasks/plan", bad).await;
+        assert_eq!(r.code(), code, "{}", r.body);
+        assert!(
+            r.body["error"]["message"].as_str().unwrap().contains(says),
+            "{}",
+            r.body
+        );
+    }
+    assert_eq!(all_events(&lead).await.len(), n);
+}
