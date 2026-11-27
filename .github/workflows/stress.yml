@@ -1,7 +1,10 @@
 name: stress
 # Full-size stress runs (HANDOFF 11, item 13), against a release build.
-# Start it by hand from the Actions tab, on any branch.
+# Runs when a branch named stress/* is pushed, or by hand from the Actions
+# tab once this file is on main.
 on:
+  push:
+    branches: ["stress/**"]
   workflow_dispatch:
     inputs:
       scenario:
@@ -32,9 +35,9 @@ jobs:
       - name: Run
         shell: bash
         run: |
-          ./target/release/cork-stress ${{ inputs.scenario }} \
-            --sync ${{ matrix.sync }} --scale ${{ inputs.scale }} \
-            --soak-secs ${{ inputs.soak_secs }} --strict | tee stress-${{ matrix.sync }}.txt
+          ./target/release/cork-stress ${{ inputs.scenario || '' }} \
+            --sync ${{ matrix.sync }} --scale ${{ inputs.scale || '1.0' }} \
+            --soak-secs ${{ inputs.soak_secs || '1800' }} --strict | tee stress-${{ matrix.sync }}.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
