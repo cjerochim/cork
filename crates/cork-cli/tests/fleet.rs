@@ -578,14 +578,20 @@ fn autoscale_grows_with_the_queue_and_shrinks_when_idle() {
         "[pool.p]\nmodel = \"haiku\"\nselect = \"work/\"\ncount = 1\nmin = 1\nmax = 4\nenv = { NAP = \"1\" }\n\
          [pool.p.autoscale]\ntarget_ready_per_worker = 1\nidle_after = \"1s\"\n",
     );
-    let ids: Vec<String> = (0..12).map(|i| create(&e, "work", &format!("t{i}"), &[])).collect();
-    until("the pool to grow to its max", Duration::from_secs(20), || {
-        f.pool(&e, "p")["target"] == 4
-    });
+    let ids: Vec<String> = (0..12)
+        .map(|i| create(&e, "work", &format!("t{i}"), &[]))
+        .collect();
+    until(
+        "the pool to grow to its max",
+        Duration::from_secs(20),
+        || f.pool(&e, "p")["target"] == 4,
+    );
     for id in &ids {
         e.wait_state(id, "completed", Duration::from_secs(30));
     }
-    until("the pool to shrink to its min", Duration::from_secs(20), || {
-        f.pool(&e, "p")["target"] == 1
-    });
+    until(
+        "the pool to shrink to its min",
+        Duration::from_secs(20),
+        || f.pool(&e, "p")["target"] == 1,
+    );
 }
