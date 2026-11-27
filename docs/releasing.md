@@ -1,6 +1,6 @@
 # Releasing Cork
 
-**Status:** proposal, for Chris to review. Nothing here is built or published yet. Chris approved semver and a single `0.1.0` first release on 2026-11-27. The other open choices are in section 9.
+**Status:** agreed plan. Nothing here is built or published yet. Chris approved semver and a single `0.1.0` first release on 2026-11-27, and accepted the recommended defaults for the rest (section 9). The release tooling is built only when Chris says go.
 
 This plan covers four things: how Cork numbers its versions, how a changelog gets written, how tags and GitHub releases happen, and how Cork later reaches crates.io and npm. The aim is a release flow that is declared in config and run by CI. A person decides *when* to release and *what the version is* by merging one pull request. Nothing else is done by hand.
 
@@ -193,10 +193,12 @@ When Chris says go, one PR adds:
 
 No Rust code changes. crates.io and npm are turned on later, each by a one-line config change and a secret.
 
-## 9. Open choices for Chris
+## 9. Decisions
 
 1. ~~**First release.**~~ **Decided 2026-11-27:** semver, and one `0.1.0` from `main` covering Milestones 1–3, no retro tags.
-2. **Changelog.** Generated from commit prefixes, with a chance to edit in the release PR (recommended), or written by hand each release?
-3. **Order of packages.** GitHub releases first, then crates.io, then npm (recommended)? Is Homebrew wanted?
-4. **npm name.** `cork-cli` (same as the crate, recommended) or a scope like `@cjerochim/cork`?
-5. **Platforms.** macOS and Linux only for now (recommended), or Windows too, which needs a test run first?
+2. **Changelog.** Generated from commit prefixes, editable in the release PR.
+3. **Order of packages.** GitHub releases first, then crates.io, then npm. No Homebrew for now.
+4. **npm name.** `cork-cli`, the same as the crate.
+5. **Platforms.** macOS and Linux only, until Windows has had a test run.
+
+Choices 2 to 5 are the recommended defaults, accepted by Chris on 2026-11-27 ("continue"). Any of them can still change before the release tooling is built.
