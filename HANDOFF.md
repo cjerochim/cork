@@ -8,6 +8,8 @@ Cork is a message board and task queue for people and coding agents. Inspired by
 
 Read this file first. Then start at "Milestone 1".
 
+**Added 2026-11-27, planned for Milestone 2, not to be built yet:** worker fleets (16).
+
 ---
 
 ## 0. What changed in v3
@@ -581,6 +583,7 @@ Out of scope for Milestone 1:
 - An SDK, an MCP server, or a UI, including the UI's sign-in (14.4).
 - Server mode (section 13). Milestone 1 must still follow 13.5, so server mode is not blocked.
 - The Postgres adapter.
+- Worker fleets (`cork workers`, section 16). In Milestone 1 a person starts each `cork tasks run` by hand.
 
 ### Done when
 
@@ -752,3 +755,116 @@ The full design goes in the UI spec, when the UI is built. These rules hold now:
 - Vercel Board tasks (claims, leases, states): https://vercel.com/docs/board/concepts/tasks
 - Independent review of v2: `REVIEW-1.md`
 - Previous version: `HANDOFF-v2.md`
+
+## 16. Worker fleets (Milestone 2, planned)
+
+**Status:** plan only, added on 2026-11-27 at Chris's request. Do not build it until Chris says go.
+
+In Milestone 1, Cork never starts workers. Each `cork tasks run` is one worker, started by a person, and its model is whatever command follows `--`. A fleet adds one command that runs many workers from a config file. It groups them into **pools**, each with its own model and agent. You can grow or shrink each pool while it runs.
+
+### 16.1 Principles
+
+- **A fleet is a plain client.** `cork workers` is a supervisor process that starts `cork tasks run` children. The daemon has no idea fleets exist: no new routes, events or tables. Everything a fleet does could be done by hand in N shells.
+- **The lease protects the work, not the supervisor.** When a worker or the supervisor dies, leases end and tasks go back to `ready`, as in 9.1. The supervisor only restores the head count.
+- **Routing stays on the board.** A pool takes work through a channel selector and labels, the same as `tasks run --ready`. The lead sends work to a pool by where it posts the task, or by its labels.
+- **One fleet per machine and config.** In server mode (13), fleets on many machines point at one board with `CORK_URL`, and their pools simply add up.
+
+### 16.2 Config
+
+`~/.config/cork/workers.toml`, or `--config FILE`:
+
+```toml
+[fleet]
+name = "dev"                # used in profile names and the control socket
+max_workers = 12            # cap across all pools
+
+[pool.hard]
+select = "work/"            # channel selector
+labels = ["tier=hard"]
+count = 3                   # initial size; min and max bound scaling
+min = 0
+max = 6
+model = "opus"
+lease = "10m"
+max_runtime = "2h"
+wait = "10m"
+command = ["claude", "-p", "Do the Cork task in $CORK_TASK_TEXT", "--model", "{model}"]
+
+[pool.easy]
+select = "work/"
+labels = ["tier=easy"]
+count = 5
+max = 10
+model = "haiku"
+command = ["claude", "-p", "Do the Cork task in $CORK_TASK_TEXT", "--model", "{model}"]
+
+[pool.other-agent]           # any agent CLI works: the command is opaque
+select = "work/review"
+count = 1
+command = ["./scripts/review-agent.sh"]
+```
+
+- `{model}` and `{pool}` are filled into `command`. They are also set as `CORK_MODEL` and `CORK_POOL` for the command.
+- `env`, `cwd` and `from` are optional per pool. `from` works as it does in `tasks run`.
+- Secrets such as API keys come from the supervisor's environment. They never go in the file or on the board.
+
+### 16.3 Commands
+
+```bash
+cork workers up [--config FILE] [--detach]   # start the fleet (foreground by default)
+cork workers status [--json]                 # pools, size, busy or idle, current task, restarts
+cork workers scale <pool> <n|+n|-n>          # resize a running pool, within min and max
+cork workers drain <pool>                    # finish current tasks, then stop the pool's workers
+cork workers reload                          # re-read the config; apply count, model and command changes
+cork workers down [--now]                    # drain everything, or with --now release and stop
+```
+
+`status`, `scale`, `drain`, `reload` and `down` talk to the running supervisor over a local Unix socket, `~/.config/cork/workers/<fleet>.sock` (mode `0600`). They do not go through the board.
+
+### 16.4 Supervision
+
+- Each worker is one child: `cork --as <fleet>-<pool>-<n> tasks run --ready <select> --label … --loop --wait <wait> -- <command>`. Profile names show which pool, and so which model, did each attempt in `tasks history`.
+- The supervisor restarts a child that exits, by its exit code (8.6):
+  - **4** (the wait ended with nothing ready): restart at once.
+  - **11** (daemon lost): restart with backoff, 1 s doubling to 30 s.
+  - **Crash or signal:** restart with backoff.
+- **Crash loop:** if a pool's workers exit 5 times in 60 s, the supervisor pauses the pool and says so in `status`. It also posts one message to `cork/fleet` naming the pool and the last error. `scale` or `reload` resumes it.
+- Children die with the supervisor (`PR_SET_PDEATHSIG` on Linux, a process group elsewhere), so a crashed supervisor leaves no orphans. Their tasks come back through leases.
+- On `SIGTERM` the supervisor drains (16.5). A second `SIGTERM`, or `down --now`, sends `SIGTERM` to every child, so each releases its task and exits 143.
+
+### 16.5 Scaling
+
+- **Up:** start the new workers at once. Never go above the pool's `max` or the fleet's `max_workers`.
+- **Down:** stop idle workers first. These are workers waiting in a claim, and stopping them costs nothing. A busy worker is **drained**: it finishes its current task, settles it, and exits. Nothing is lost and no attempt is wasted.
+- Draining needs one addition to `tasks run`: **`SIGUSR1` means "finish this task, then exit 0 instead of claiming another".** It is a small, separate change that is useful without fleets too.
+- **Changing a pool's model or command** with `reload` drains the old workers and starts new ones. Tasks in progress finish on the model that started them.
+- **Autoscaling** comes after manual scaling, and is opt-in per pool:
+
+  ```toml
+  [pool.easy.autoscale]
+  target_ready_per_worker = 2   # grow while ready tasks per worker > 2
+  idle_after = "5m"             # shrink a worker idle this long
+  ```
+
+  The supervisor reads the ready count with `GET /tasks?state=ready&channel=…&label=…`, at most every 10 s. It also wakes on events from `/events`. It stays within `min` and `max`.
+
+### 16.6 Choosing the model for a task
+
+- **By where it is posted:** the lead posts hard work with `--label tier=hard` and easy work with `tier=easy`. Pools select on those labels.
+- **The skill** (`SKILL.md`) gets a short section for leads on picking a tier.
+- **Escalation is an open question.** A task that failed on the easy pool may deserve a retry on the hard pool. Options:
+  1. The lead creates a new task with `tier=hard` that links to the old one. This works with Milestone 1 as it is.
+  2. A future `tasks relabel <id>` that writes a `TaskRelabeled` event.
+
+  Option 1 is the default until there is a reason for 2.
+
+### 16.7 Done when (for Milestone 2)
+
+1. **Restart:** `kill -9` one worker of a pool of 3. The supervisor starts a replacement within 2 s, and the killed worker's task completes on a later attempt.
+2. **Scale down without loss:** `scale easy 5 → 1` while 5 workers are busy. All 5 tasks complete, none is released or failed, and 4 workers exit.
+3. **Scale up:** `scale hard +3` puts 3 more workers in a claim within 2 s.
+4. **Routing:** with pools on `tier=hard` and `tier=easy`, every task is claimed by a worker of the matching pool (check the profiles in the log).
+5. **Crash loop:** a command that exits at once pauses its pool after 5 exits, and the other pools keep working.
+6. **Supervisor death:** `kill -9` the supervisor. No child outlives it by more than 1 s, and every task it held returns to `ready` within one lease.
+7. **Reload:** changing a pool's model drains the old workers, and later tasks run with the new model (`CORK_MODEL`).
+8. **Plain client:** the fleet tests run against an unmodified Milestone 1 daemon, apart from the `SIGUSR1` drain in `tasks run`.
