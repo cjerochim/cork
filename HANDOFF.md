@@ -10,7 +10,7 @@ Read this file first. Then start at "Milestone 1".
 
 **Added 2026-11-27, planned for Milestone 2, not to be built yet:** worker fleets with keyword routing (16), and a lead agent with parent and child tasks (17). **Planned for Milestone 3:** observability of performance, cost and usage (18).
 
-**Added 2026-11-27, planned, not built:** task dependencies and the `waiting` state, in the core (6.8). Its two open proposals are for Chris to review (6.8.10).
+**Added 2026-11-27, planned, not built:** task dependencies and the `waiting` state, in the core (6.8). Signed off by Chris on 2026-11-27, including both decisions in 6.8.10.
 
 ---
 
@@ -302,7 +302,7 @@ Anyone else gets `task_not_owned`. A wrong starting state gets `invalid_state`. 
 
 ### 6.8 Dependencies (planned, not built)
 
-**Status (2026-11-27):** the core rules below are agreed with Chris, including that dependencies are fixed at creation and that a replacement is declared, not edited in (6.8.3). Two items marked **Proposal** are not confirmed yet and are for Chris to review (6.8.10). Nothing here is built. Chris picks the milestone.
+**Status (2026-11-27):** signed off by Chris. That covers the core rules, dependencies fixed at creation, replacement declared, not edited in (6.8.3), and both decisions in 6.8.10. Nothing here is built. The build waits for Chris to say go, and Chris picks the milestone.
 
 **Why it is in the core.** Readiness is the board's call, so dependencies are too. A worker or a client cannot decide that a task is ready, the same way it cannot decide that a lease is live (3). Keyword routing (16) stays out of the core because it only chooses *which* worker takes a ready task. Dependencies decide *whether* a task is ready at all.
 
@@ -349,7 +349,7 @@ cork tasks create work "<retry text>" --replaces $OLD --needs typescript,tier-2 
 | `TaskCreated` (schema 2) | the new task | the creator | adds `depends_on: [id]`, `replaces?: id`, and `open_dependencies: [id]`: the declared ids whose head was not `completed` at create time | `waiting` if `open_dependencies` is not empty, else `ready` |
 | `TaskReplaced` | the old task | the creator of the retry | `{ by: <new id> }` | `canceled`, or unchanged if already `failed` or `canceled` |
 | `DependenciesMet` | each dependent that this commit readies | `cork` | `{ met_by: <id of the task whose completion met the last dependency> }` | `ready` |
-| `DependencyFailed` (Proposal 1) | each waiting dependent | `cork` | `{ dependency: <declared id>, head: <id>, state: "failed" \| "canceled", reason? }` | `waiting` (unchanged) |
+| `DependencyFailed` (Decision 1) | each waiting dependent | `cork` | `{ dependency: <declared id>, head: <id>, state: "failed" \| "canceled", reason? }` | `waiting` (unchanged) |
 | `TaskReopened` (schema 2) | the reopened task | the owner | adds `open_dependencies: [id]`, decided at reopen time | `waiting` if not empty, else `ready` |
 | `DependenciesChanged` | reserved, not written | | | |
 
@@ -361,7 +361,7 @@ Schema 1 of `TaskCreated` and `TaskReopened` upcasts to empty lists and no `repl
 
 - **Create** with `depends_on`: every id must be a task on this board (`not_found` otherwise). At most 64 dependencies per task (`invalid_input`). Duplicates are dropped. A dependency may be in any channel and any state, including replaced (it then resolves to its head). If every head is `completed`, the task starts `ready`.
 - **Complete** a task `Y`: in the same commit, for each waiting task with a dependency whose head is `Y`, and whose dependencies are now *all* met, append `DependenciesMet { met_by: Y }`. Dependents are visited in task id order, so the commit is deterministic. A replayed `complete` (6.4) writes nothing, so nothing readies twice. Readying a task counts as "makes a task ready" for the waiting-claim queue (6.5), which hands it out in the same transaction.
-- **Fail or cancel** a task that is the head of some waiting task's dependency (including `TaskFailed` after the last lease, 6.6, whether a decision or the lease timer writes it): the dependents stay `waiting`. See Proposal 1 for how that is surfaced.
+- **Fail or cancel** a task that is the head of some waiting task's dependency (including `TaskFailed` after the last lease, 6.6, whether a decision or the lease timer writes it): the dependents stay `waiting`. See Decision 1 for how that is surfaced.
 - **Replace** a task: as in 6.8.3. Its dependents now resolve to the retry, so nothing is readied or failed by the replacement itself.
 - **Reopen a dependency** `Y`: dependents that are already `ready` or further along are not touched. The board never moves a task back into `waiting`. Dependents still waiting count `Y` as unmet again, so they ready only when `Y` completes again.
 - **Reopen a dependent:** the writer resolves its dependencies again and records `open_dependencies` on `TaskReopened`. It goes to `waiting` or `ready`.
@@ -394,9 +394,9 @@ Schema 1 of `TaskCreated` and `TaskReopened` upcasts to empty lists and no `repl
 | --- | --- |
 | `POST /tasks` | Optional `depends_on: [id]` or `replaces: id` |
 | `POST /tasks/plan` | Many tasks in one commit (6.8.8) |
-| `GET /tasks/{id}` | Adds `depends_on`, each with the declared id, its head, the head's effective state and `completed_at`; `dependents` (ids and states); `replaces` and `replaced_by`; and `stuck` (Proposal 1) |
+| `GET /tasks/{id}` | Adds `depends_on`, each with the declared id, its head, the head's effective state and `completed_at`; `dependents` (ids and states); `replaces` and `replaced_by`; and `stuck` (Decision 1) |
 | `GET /tasks` | Adds `waiting_on=<id>`: the tasks with a dependency that resolves to that task. Adds `stuck=true`. |
-| `POST /tasks/claim` | When `claimed`, the body adds `dependencies` (Proposal 2) |
+| `POST /tasks/claim` | When `claimed`, the body adds `dependencies` (Decision 2) |
 
 All of these are additive, as 7.6 requires.
 
@@ -443,7 +443,7 @@ A plan declares a set of tasks and how they relate. The board creates them all i
 3. **Nothing is stuck by the board.** At every commit boundary, no task is `waiting` while the heads of all its dependencies are `completed`.
 4. No `TaskClaimed` while a task is `waiting`.
 5. **Replacement:** each task has at most one `TaskReplaced`; its `by` names a task whose `TaskCreated` has `replaces` naming it, in the same commit, with a higher position. That task's `depends_on` equals the old one's. No `TaskClaimed`, `TaskCompleted` or `TaskReopened` on a task after its `TaskReplaced`. No chain is longer than 16.
-6. (Proposal 1) For each `TaskFailed` or `TaskCanceled` of a task, every task then waiting on it as a head has exactly one `DependencyFailed` naming it, in the same commit. A `TaskReplaced` writes no `DependencyFailed`.
+6. (Decision 1) For each `TaskFailed` or `TaskCanceled` of a task, every task then waiting on it as a head has exactly one `DependencyFailed` naming it, in the same commit. A `TaskReplaced` writes no `DependencyFailed`.
 7. Every declared `depends_on` id has a lower `created_position` than the task, or is in the same plan commit with no cycle.
 8. Folding each task's stream alone gives the stored state. The fold never reads another stream.
 
@@ -456,9 +456,9 @@ Done when, beside unit tests in `cork-core` for every rule in 6.8.5:
 - **Chaos:** the chaos stress run (11, Done when 13) with random dependencies and random replacements. Invariants 1 to 8 hold.
 - **Replay:** `show --at` at each position of a waiting, met, claimed, completed task, and of a replaced one, matches the log. `debug rebuild` and `export` / `serve --import` keep both projections and every state.
 
-#### 6.8.10 Proposals for Chris to review (not confirmed)
+#### 6.8.10 Decisions confirmed by Chris (2026-11-27)
 
-**Proposal 1. A failed dependency is surfaced; it does not fail the dependent.**
+**Decision 1 (confirmed). A failed dependency is surfaced; it does not fail the dependent.**
 
 When the head of a dependency ends `failed` or `canceled`, the dependent stays `waiting`. The board does not fail it, because the work may still get done by a replacement or a reopen, and that is a decision for the lead or the person.
 
@@ -466,7 +466,7 @@ When the head of a dependency ends `failed` or `canceled`, the dependent stays `
 - **The fact is recorded once.** The commit that fails or cancels the head appends `DependencyFailed { dependency, head, state, reason }` to each waiting dependent. The event carries the index label `board.mention=<handle>` for the handle that created the dependent, and for its owner if that is a different handle. So `cork wait --mentions`, a person's inbox and a lead's wait all see it through the existing mention filter (7.4), and no message is posted to make that happen.
 - **What the lead or person can then do,** with nothing new: reopen the dependency, replace it (6.8.3), or cancel the dependent.
 
-**Proposal 2. The results of dependencies are passed to the dependent.**
+**Decision 2 (confirmed). The results of dependencies are passed to the dependent.**
 
 - The claim response gains `dependencies: [{ task_id, head, text, result, completed_at, holder }]`, with the result of each head's latest `TaskCompleted`. `text` is the first 2 KB of the head's root message.
 - `tasks run` writes them to a JSON file and sets `CORK_DEPENDENCIES` to its path, beside `CORK_PREVIOUS` (9). Up to 64 results of 64 KB each is at most 4 MB, so a file, not an environment variable.
@@ -477,7 +477,7 @@ When the head of a dependency ends `failed` or `canceled`, the dependent stays `
 
 - **Editable dependencies** (`DependenciesChanged`, by the owner, while a task is waiting or ready). It would need a cycle check inside the write transaction, a graph walk in the stress checker, and a way for the owner to move a ready task back to waiting. It also makes the lead edit the tasks around a retry, which is explicit work the board can derive. Rejected for now; the event name stays reserved.
 - **A narrow "move the dependents to the retry" edit** in `tasks escalate`. It rewrites other tasks' dependencies, needs its own cycle check, and makes replay depend on when the edit happened. `--replaces` gives the same result by declaring one fact on the retry.
-- **Failing the dependent automatically** when a dependency fails. It throws away a plan that a replacement could still finish, and the lead would have to reopen every dependent. Kept out by Proposal 1.
+- **Failing the dependent automatically** when a dependency fails. It throws away a plan that a replacement could still finish, and the lead would have to reopen every dependent. Kept out by Decision 1.
 - **Posting a reply from `cork`** to tell the owner a dependency failed. A mention label on `DependencyFailed` reaches the same people without a message nobody wrote.
 
 #### 6.8.12 How the lead uses it
