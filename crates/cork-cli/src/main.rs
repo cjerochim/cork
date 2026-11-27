@@ -3,6 +3,7 @@
 mod escalate;
 mod run;
 mod serve;
+mod usage;
 mod workers;
 
 use clap::{Args, Parser, Subcommand};
@@ -325,6 +326,11 @@ enum TaskCmd {
         looping: bool,
         #[arg(long, value_parser = parse_duration)]
         max_runtime: Option<Duration>,
+        /// Read the agent's usage from its output: `claude-json` for Claude
+        /// Code with `--output-format json`. Without it, the command may
+        /// still write usage to $CORK_USAGE.
+        #[arg(long, value_name = "PARSER")]
+        usage: Option<usage::Parser>,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
@@ -1041,6 +1047,7 @@ async fn tasks(
             lease,
             looping,
             max_runtime,
+            usage: usage_parser,
             command,
         } => {
             let target = match (id, &r.ready) {
@@ -1064,6 +1071,7 @@ async fn tasks(
                     max_runtime,
                     command,
                     json,
+                    usage: usage_parser,
                 },
             )
             .await);

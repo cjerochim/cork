@@ -24,6 +24,7 @@ These are set for you:
 | `CORK_ATTEMPT` | 1 for the first attempt, 2 or more if earlier attempts failed or crashed. |
 | `CORK_RESULT` | A file. Write your result here; it becomes the task's result. |
 | `CORK_PREVIOUS` | Attempt 2 and later: notes from earlier attempts. |
+| `CORK_USAGE` | A file. Optional: write your usage here as JSON, such as `{"model": "...", "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "turns": 0}`. The wrapper posts it as a `usage=attempt` reply. Numbers and names only, never prompts or output. |
 
 How your run ends decides the task:
 
