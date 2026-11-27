@@ -2,6 +2,7 @@
 
 mod run;
 mod serve;
+mod workers;
 
 use clap::{Args, Parser, Subcommand};
 use cork_api::*;
@@ -90,6 +91,9 @@ enum Cmd {
         labels: Vec<String>,
         #[arg(long)]
         mentions: bool,
+        /// Wake on these event types, such as TaskCompleted, instead of messages.
+        #[arg(long = "type")]
+        types: Vec<String>,
         #[arg(long, value_parser = parse_duration, default_value = "10m")]
         timeout: Duration,
     },
@@ -120,10 +124,44 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DebugCmd,
     },
+    /// Worker fleets: keywords and matching (HANDOFF 16).
+    Workers {
+        #[command(subcommand)]
+        cmd: WorkersCmd,
+    },
     /// Manage the daemon's token.
     Token {
         #[command(subcommand)]
         cmd: TokenCmd,
+    },
+}
+
+/// Where the model catalog and fleet config come from.
+#[derive(Args, Clone)]
+struct FleetFiles {
+    /// The model catalog (models.toml, or .json).
+    #[arg(long, value_name = "FILE")]
+    models: Option<PathBuf>,
+    /// The fleet config (workers.toml, or .json).
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum WorkersCmd {
+    /// The keyword vocabulary, its aliases, and which models cover each one.
+    Keywords {
+        #[command(flatten)]
+        files: FleetFiles,
+    },
+    /// Dry run: which models and pools could take a task, and why not.
+    Match {
+        task_id: Option<String>,
+        /// Ask about a task before it exists.
+        #[arg(long, value_delimiter = ',', conflicts_with = "task_id")]
+        needs: Vec<String>,
+        #[command(flatten)]
+        files: FleetFiles,
     },
 }
 
@@ -166,6 +204,13 @@ enum TaskCmd {
         /// Only this handle may claim it.
         #[arg(long = "for")]
         assignee: Option<String>,
+        /// Keywords the task needs, checked against the model catalog:
+        /// `--needs rust,docs` adds `needs.rust=yes` and `needs.docs=yes`.
+        #[arg(long, value_delimiter = ',')]
+        needs: Vec<String>,
+        /// The model catalog for --needs.
+        #[arg(long, value_name = "FILE")]
+        models: Option<PathBuf>,
     },
     Claim {
         id: Option<String>,
@@ -387,6 +432,24 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
             }
             return Ok(1);
         }
+        Cmd::Workers {
+            cmd: WorkersCmd::Keywords { files },
+        } => {
+            let l = workers::load(&home, files.models.as_deref(), files.config.as_deref())?;
+            workers::keywords(&l, cli.json);
+            return Ok(0);
+        }
+        Cmd::Workers {
+            cmd:
+                WorkersCmd::Match {
+                    task_id: None,
+                    needs,
+                    files,
+                },
+        } => {
+            let l = workers::load(&home, files.models.as_deref(), files.config.as_deref())?;
+            return workers::matches(&l, None, None, needs, cli.json).await;
+        }
         _ => {}
     }
 
@@ -399,7 +462,21 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
         Cmd::Serve { .. } | Cmd::Token { .. } => unreachable!(),
         Cmd::Debug {
             cmd: DebugCmd::Rebuild { .. },
+        }
+        | Cmd::Workers {
+            cmd: WorkersCmd::Keywords { .. } | WorkersCmd::Match { task_id: None, .. },
         } => unreachable!(),
+        Cmd::Workers {
+            cmd:
+                WorkersCmd::Match {
+                    task_id: Some(id),
+                    files,
+                    ..
+                },
+        } => {
+            let l = workers::load(&home, files.models.as_deref(), files.config.as_deref())?;
+            return workers::matches(&l, Some(&client), Some(&id), &[], json).await;
+        }
         Cmd::Whoami => {
             let w = client.whoami().await?;
             if json {
@@ -490,8 +567,9 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
             target,
             labels,
             mentions,
+            types,
             timeout,
-        } => return wait(&client, &target, &labels, mentions, timeout, json).await,
+        } => return wait(&client, &target, &labels, mentions, &types, timeout, json).await,
         Cmd::Tail {
             target,
             labels,
@@ -574,13 +652,17 @@ async fn wait(
     target: &str,
     labels: &[String],
     mentions: bool,
+    types: &[String],
     timeout: Duration,
     json: bool,
 ) -> Result<i32, ClientError> {
     let mut p = vec![target_param(target)];
     // A wait is for messages, except a wait on a task state such as
-    // `board.task=completed`, which matches the task's own events.
-    if !labels.iter().any(|l| l.starts_with("board.task=")) {
+    // `board.task=completed`, which matches the task's own events, or a
+    // wait on event types named with --type (HANDOFF 17.1).
+    if !types.is_empty() {
+        p.extend(types.iter().map(|t| ("type", t.clone())));
+    } else if !labels.iter().any(|l| l.starts_with("board.task=")) {
         p.push(("type", cork_core::message::MESSAGE_POSTED.to_string()));
     }
     p.extend(labels.iter().map(|l| ("label", l.clone())));
@@ -707,11 +789,18 @@ async fn tasks(
             lease,
             max_attempts,
             assignee,
+            needs,
+            models,
         } => {
+            let mut labels = parse_labels(&m.labels)?;
+            if !needs.is_empty() {
+                let l = workers::load(&home, models.as_deref(), None)?;
+                labels.extend(workers::needs_labels(&l.catalog, &needs)?);
+            }
             let req = CreateTaskReq {
                 channel,
                 text,
-                labels: parse_labels(&m.labels)?,
+                labels,
                 data: parse_data(&m.data)?,
                 lease_ms: ms(lease),
                 max_attempts,

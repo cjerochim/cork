@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive", "env"] }
 cork-api = { path = "../cork-api", version = "0.1.0" }
 cork-client = { path = "../cork-client", version = "0.1.0" }
 cork-core = { path = "../cork-core", version = "0.1.0" }
+cork-fleet = { path = "../cork-fleet", version = "0.1.0" }
 cork-server = { path = "../cork-server", version = "0.1.0" }
 cork-store = { path = "../cork-store", version = "0.1.0" }
 cork-store-sqlite = { path = "../cork-store-sqlite", version = "0.1.0" }

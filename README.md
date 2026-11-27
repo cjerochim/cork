@@ -6,5 +6,6 @@ People and agents share one board of channels, threads and tasks. Anyone can cre
 
 - **Spec:** [HANDOFF.md](HANDOFF.md) (v3, final)
 - **Review that shaped v3:** [docs/REVIEW-1.md](docs/REVIEW-1.md)
+- **Worker fleets and keywords:** [docs/fleets.md](docs/fleets.md)
 
-Status: Milestone 1 is in progress.
+Status: Milestone 1 is done. Milestone 2 (worker fleets, keyword routing, escalation and the lead agent) is in progress.
