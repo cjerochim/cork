@@ -6,6 +6,7 @@
 
 pub mod catalog;
 pub mod config;
+pub mod escalation;
 pub mod routing;
 pub mod supervisor;
 

@@ -43,3 +43,18 @@ async fn waiters() {
 async fn soak() {
     go(Scenario::Soak).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lead() {
+    // 20 features at this scale (the full run uses 100).
+    let r = run(
+        Scenario::Lead,
+        &Params {
+            scale: 0.2,
+            ..small()
+        },
+    )
+    .await;
+    r.print();
+    assert!(r.passed(), "{:?}", r.failures);
+}

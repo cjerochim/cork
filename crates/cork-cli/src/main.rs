@@ -1,5 +1,6 @@
 //! `cork`: the command line for the board (HANDOFF 8).
 
+mod escalate;
 mod run;
 mod serve;
 mod workers;
@@ -299,6 +300,18 @@ enum TaskCmd {
     },
     Reopen {
         id: String,
+    },
+    /// Retry a struggling task one tier up, from its earlier branch (16.7).
+    Escalate {
+        id: String,
+        /// More keywords the retry needs, such as large-context.
+        #[arg(long, value_delimiter = ',')]
+        needs: Vec<String>,
+        /// Refuse past this many escalations of one task.
+        #[arg(long, default_value_t = cork_fleet::escalation::DEFAULT_MAX_ESCALATIONS)]
+        max: u32,
+        #[command(flatten)]
+        files: FleetFiles,
     },
     /// Claim a task, run a command, and settle from its exit.
     Run {
@@ -1012,6 +1025,15 @@ async fn tasks(
         }
         TaskCmd::Reopen { id } => {
             return unclaimed(&client, &id, "reopen", SettleReq::default(), key, json).await;
+        }
+        TaskCmd::Escalate {
+            id,
+            needs,
+            max,
+            files,
+        } => {
+            let l = workers::load(&home, files.models.as_deref(), files.config.as_deref())?;
+            return escalate::escalate(&client, &l, &id, &needs, max, json).await;
         }
         TaskCmd::Run {
             id,

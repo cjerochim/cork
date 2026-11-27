@@ -760,7 +760,7 @@ The full design goes in the UI spec, when the UI is built. These rules hold now:
 
 ## 16. Worker fleets (Milestone 2, planned)
 
-**Status:** plan only, added on 2026-11-27 at Chris's request. Do not build it until Chris says go.
+**Status:** built in Milestone 2 (PRs #8 to #10). User guide: docs/fleets.md.
 
 In Milestone 1, Cork never starts workers. Each `cork tasks run` is one worker, started by a person, and its model is whatever command follows `--`. A fleet adds one command that runs many workers from config files. It groups them into **pools**, each running one model or agent, and lets you grow or shrink each pool while it runs. Tasks reach the right model by **keywords**: plain labels that match what each model can do.
 
@@ -990,7 +990,7 @@ From these, anyone can answer "which tasks needed escalating, from which model t
 
 ## 17. A lead agent and parent and child tasks (Milestone 2, an experiment)
 
-**Status:** plan only, added on 2026-11-27 at Chris's request. Chris wants to try it and measure how it does. Do not build it until Chris says go.
+**Status:** tooling built in Milestone 2 (PR #10): the lead skill, `wait --type`, `tasks escalate` and the `lead` stress scenario. The real runs in 17.5 are still to do; see docs/lead-experiment.md.
 
 The idea: one agent, the **lead**, owns a feature for a person.
 - It splits the feature into tasks, which the workers (16) do.

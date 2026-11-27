@@ -146,3 +146,46 @@ The supervisor handles each child's exit by its code:
 - **Reload:** a change of a pool's model, command, env, cwd, lease or max runtime drains the old workers and starts new ones. Tasks in progress finish on the model that started them. A config with an error is refused, and the running config stays.
 - **No orphans (Linux):** children get `SIGTERM` when the supervisor dies, so each wrapper releases its task and exits. The command under `tasks run` also gets `SIGTERM` if its wrapper dies. A first `SIGTERM` or Ctrl-C drains; a second stops every child now.
 - **Two fleets, one board:** fleets on one or many machines can share a board. The single writer gives each task one winner; the loser exits 7 and moves on.
+
+## Escalating a struggling task
+
+```bash
+cork tasks escalate <id> [--needs large-context] [--max 2]
+```
+
+This makes a **retry** one tier up. Labels are fixed when a task is created, so the old task is never changed. The retry:
+
+- keeps the old task's channel, lease, max attempts and other labels, such as `parent`;
+- needs the old keywords, plus any given with `--needs`, plus `tier-<N+1>`. N is the highest of the tier the task asked for, the tier of the model that last claimed it (when this machine's fleet knows the profile), and the tier of the cheapest model that covers it;
+- carries `retry_of=<old>` and `escalation=<n>`;
+- has a text that names the earlier branches (`cork/<old>/<attempt>`), the last failure, and the claimers' progress notes, followed by the original task text.
+
+Then `tasks escalate`:
+
+- cancels the old task if it is ready or blocked;
+- replies in the old thread with a link to the retry.
+
+Every write uses an idempotency key made from the old id, so running it again after a crash returns the same retry. It exits 3, creating nothing, when:
+
+- there is no higher tier,
+- no model covers the new needs, or
+- the work was already escalated `--max` times (default 2).
+
+## Leading a feature
+
+A lead is one more pool, on the strongest model, selecting only `features/`. Worker pools never select `features/`, so only the lead takes features:
+
+```toml
+[pool.lead]
+model = "opus"
+select = "features/"
+count = 1
+lease = "30m"
+command = ["claude", "-p", "Lead the Cork feature in $CORK_TASK_TEXT. Follow skills/cork-lead/SKILL.md.", "--model", "{model}"]
+```
+
+```bash
+cork tasks create features "<brief>" --label kind=feature
+```
+
+The lead links children to the feature with plain labels (`parent=<feature id>`), and creates them under keys `<feature>-<n>`, so a restarted lead duplicates nothing. See [skills/cork-lead/SKILL.md](../skills/cork-lead/SKILL.md), and [lead-experiment.md](lead-experiment.md) for how it will be measured.

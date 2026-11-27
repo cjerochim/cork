@@ -12,7 +12,7 @@ use cork_stress::scenarios::{Params, Scenario, run};
 #[derive(Parser)]
 #[command(about = "Stress tests for Cork, with log invariants")]
 struct Args {
-    /// Which scenario to run. Leave out to run all five.
+    /// Which scenario to run. Leave out to run them all.
     scenario: Option<Scenario>,
     /// SQLite durability. Run once with each to compare.
     #[arg(long, value_enum, default_value = "full")]
@@ -45,6 +45,7 @@ async fn main() {
             Scenario::Chaos,
             Scenario::Waiters,
             Scenario::Soak,
+            Scenario::Lead,
         ],
     };
     let mut ok = true;

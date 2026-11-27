@@ -595,3 +595,249 @@ fn autoscale_grows_with_the_queue_and_shrinks_when_idle() {
         || f.pool(&e, "p")["target"] == 1,
     );
 }
+
+/// Models for the escalation scenario: haiku leaves a branch and fails;
+/// sonnet succeeds only when told where the earlier branch is.
+const ESCALATION_MODELS: &str = r#"
+[keywords]
+typescript = "TypeScript"
+large-context = "Large files"
+docs = "Prose"
+
+[model.haiku]
+command = ["sh", "-c", "cork progress \"pushed branch cork/$CORK_TASK/$CORK_ATTEMPT at abc123\"; sleep 2.2; echo 'tests in importer.test.ts fail on files over 1 GB' > $CORK_RESULT; exit 1"]
+tier = 1
+cost = 1
+keywords = ["typescript", "docs"]
+
+[model.sonnet]
+command = ["sh", "-c", "b=$(printf '%s' \"$CORK_TASK_TEXT\" | grep -o 'branch cork/[0-9A-Z]*/1' | head -1); [ -n \"$b\" ] || exit 1; echo \"$CORK_MODEL continued from ${b#branch }\""]
+tier = 2
+cost = 3
+keywords = ["typescript", "large-context", "docs"]
+
+[model.opus]
+command = ["sh", "-c", "echo opus"]
+tier = 3
+cost = 15
+keywords = ["typescript", "large-context", "docs"]
+"#;
+
+#[test]
+fn escalation_scenario_retries_one_tier_up_from_the_old_branch() {
+    // 16.8 item 8, scripted with fake workers and a fake lead.
+    let e = Env::new();
+    let f = Fleet::up(
+        &e,
+        "e",
+        "[pool.fast]\nmodel = \"haiku\"\nselect = \"work/\"\ncount = 1\n\
+         [pool.mid]\nmodel = \"sonnet\"\nselect = \"work/\"\ncount = 1\n\
+         [pool.strong]\nmodel = \"opus\"\nselect = \"work/\"\ncount = 1\n",
+    );
+    // Swap in this scenario's catalog; reload so the fleet runs it.
+    std::fs::write(e.home().join("models.toml"), ESCALATION_MODELS).unwrap();
+    f.ctl(&e, &["reload"]);
+    let cfg = f.config.to_str().unwrap().to_string();
+
+    // 1. The plan: a feature, and a child on the cheapest model.
+    let feature = create(
+        &e,
+        "features",
+        "Importer handles big files",
+        &["--label", "kind=feature"],
+    );
+    let parent = format!("parent={feature}");
+    let old = create(
+        &e,
+        "work",
+        "Make the importer stream large files",
+        &[
+            "--needs",
+            "typescript",
+            "--label",
+            &parent,
+            "--max-attempts",
+            "1",
+        ],
+    );
+    // 2. The struggle: the lead waits on the feature's children.
+    let o = e.expect(
+        0,
+        &[
+            "--json",
+            "wait",
+            "work/",
+            "--label",
+            &parent,
+            "--type",
+            "TaskFailed",
+            "--type",
+            "TaskCompleted",
+            "--timeout",
+            "30s",
+        ],
+    );
+    let ev: Value = serde_json::from_str(&o).unwrap();
+    assert_eq!(ev["type"], "TaskFailed");
+    assert_eq!(claimers(&history(&e, &old)), vec!["e-fast-1"]);
+    // 3. The decision: who covers it one tier up?
+    let m = e.json(&[
+        "workers",
+        "match",
+        "--needs",
+        "typescript,large-context,tier-2",
+        "--config",
+        &cfg,
+    ]);
+    let cheapest = m["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["covers"] == true)
+        .unwrap();
+    assert_eq!(cheapest["model"], "sonnet");
+    assert_eq!(m["choice"]["pool"], "mid");
+    // 4. The handover, twice, as a lead restarted mid-escalation would.
+    let first = e.json(&[
+        "tasks",
+        "escalate",
+        &old,
+        "--needs",
+        "large-context",
+        "--config",
+        &cfg,
+    ]);
+    let again = e.json(&[
+        "tasks",
+        "escalate",
+        &old,
+        "--needs",
+        "large-context",
+        "--config",
+        &cfg,
+    ]);
+    assert_eq!(first["retry"], again["retry"], "no second retry");
+    assert_eq!(first["tier"], 2);
+    let retry = first["retry"].as_str().unwrap().to_string();
+    let list = e.json(&["tasks", "list", "--label", &format!("retry_of={old}")]);
+    assert_eq!(list["tasks"].as_array().unwrap().len(), 1);
+    // 5. The finish: a tier 2 profile continues from the old branch.
+    e.wait_state(&retry, "completed", Duration::from_secs(20));
+    let h = history(&e, &retry);
+    assert_eq!(claimers(&h), vec!["e-mid-1"]);
+    let t = e.json(&["tasks", "show", &retry]);
+    assert_eq!(
+        t["task"]["result"].as_str().unwrap().trim(),
+        format!("sonnet continued from cork/{old}/1")
+    );
+    assert_eq!(t["task"]["labels"]["parent"], feature.as_str());
+    assert_eq!(t["task"]["labels"]["needs.tier-2"], "yes");
+    // The history reads both ways: one link reply in the old thread.
+    let thread = e.json(&["read", &old]);
+    let links: Vec<&Value> = thread["replies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("Escalated to {retry}"))
+        })
+        .collect();
+    assert_eq!(links.len(), 1);
+    // Both children show under the feature.
+    let kids = e.json(&["tasks", "list", "--label", &parent]);
+    assert_eq!(kids["tasks"].as_array().unwrap().len(), 2);
+    // The second escalation goes to tier 3; a third is refused.
+    let r2 = e.json(&["tasks", "escalate", &retry, "--config", &cfg]);
+    assert_eq!(r2["tier"], 3);
+    let r2 = r2["retry"].as_str().unwrap().to_string();
+    e.wait_state(&r2, "completed", Duration::from_secs(20));
+    e.expect(3, &["tasks", "escalate", &r2, "--config", &cfg]);
+}
+
+#[test]
+fn escalating_a_ready_task_cancels_it() {
+    let e = Env::new();
+    std::fs::write(e.home().join("models.toml"), ESCALATION_MODELS).unwrap();
+    let old = create(&e, "parked", "write docs", &["--needs", "docs"]);
+    let r = e.json(&["tasks", "escalate", &old]);
+    assert_eq!(r["canceled_old"], true);
+    assert_eq!(e.state(&old), "canceled");
+    let t = e.json(&["tasks", "show", &old]);
+    assert!(
+        t["task"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("escalated to")
+    );
+}
+
+/// A fake lead: plans three children under idempotency keys, sleeps on its
+/// first attempt (to be killed), then waits for its children and reports.
+const FAKE_LEAD: &str = r#"#!/bin/sh
+F=$CORK_TASK
+for n in 1 2 3; do
+  cork --idempotency-key "$F-$n" tasks create work "child $n of $F" --label parent=$F >/dev/null || exit 1
+done
+[ "$CORK_ATTEMPT" = 1 ] && sleep 30
+while [ "$(cork tasks list --label parent=$F | grep -vc completed)" != 0 ]; do
+  cork wait work/ --label parent=$F --type TaskCompleted --timeout 2s >/dev/null
+done
+echo "rollup: $(cork tasks list --label parent=$F | grep -c completed) completed"
+"#;
+
+#[test]
+fn the_lead_pool_takes_features_and_a_restarted_lead_duplicates_nothing() {
+    // 17.6 items 2 and 3.
+    let e = Env::new();
+    let lead = e.home().join("lead.sh");
+    std::fs::write(&lead, FAKE_LEAD).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lead, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let f = Fleet::up(
+        &e,
+        "f",
+        &format!(
+            "[pool.w]\nmodel = \"haiku\"\nselect = \"work/\"\ncount = 2\n\
+             [pool.lead]\nmodel = \"opus\"\nselect = \"features/\"\ncount = 1\nlease = \"2s\"\ncommand = [\"{}\"]\n",
+            lead.display()
+        ),
+    );
+    let feature = create(&e, "features", "Ship it", &["--label", "kind=feature"]);
+    let parent = format!("parent={feature}");
+    until("the plan", Duration::from_secs(10), || {
+        e.json(&["tasks", "list", "--label", &parent])["tasks"]
+            .as_array()
+            .unwrap()
+            .len()
+            == 3
+    });
+    // Kill the lead mid-feature.
+    let p = f.pool(&e, "lead");
+    let pid = p["workers"][0]["pid"].as_i64().unwrap();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    e.wait_state(&feature, "completed", Duration::from_secs(30));
+    let kids = e.json(&["tasks", "list", "--label", &parent]);
+    assert_eq!(kids["tasks"].as_array().unwrap().len(), 3, "no duplicates");
+    let t = e.json(&["tasks", "show", &feature]);
+    assert_eq!(
+        t["task"]["result"].as_str().unwrap().trim(),
+        "rollup: 3 completed"
+    );
+    // Only the lead pool ever claimed the feature; workers took the children.
+    for c in claimers(&history(&e, &feature)) {
+        assert!(c.starts_with("f-lead-"), "{c} took the feature");
+    }
+    for k in kids["tasks"].as_array().unwrap() {
+        let id = k["id"].as_str().unwrap();
+        for c in claimers(&history(&e, id)) {
+            assert!(c.starts_with("f-w-"), "{c} took a child");
+        }
+    }
+}
