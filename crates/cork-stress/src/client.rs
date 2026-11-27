@@ -45,12 +45,25 @@ impl Client {
     }
 
     async fn call(&self, m: reqwest::Method, path: &str, body: Option<Value>) -> CallResult<Value> {
+        self.call_idem(m, path, body, None).await
+    }
+
+    async fn call_idem(
+        &self,
+        m: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        key: Option<&str>,
+    ) -> CallResult<Value> {
         let mut r = self
             .http
             .request(m, format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .header("x-cork-profile", &self.profile)
             .timeout(Duration::from_secs(120));
+        if let Some(k) = key {
+            r = r.header("idempotency-key", k);
+        }
         if let Some(b) = body {
             r = r.json(&b);
         }
@@ -73,6 +86,12 @@ impl Client {
 
     pub async fn post(&self, path: &str, body: Value) -> CallResult<Value> {
         self.call(reqwest::Method::POST, path, Some(body)).await
+    }
+
+    /// A POST made safe to retry with an idempotency key.
+    pub async fn post_idem(&self, path: &str, body: Value, key: &str) -> CallResult<Value> {
+        self.call_idem(reqwest::Method::POST, path, Some(body), Some(key))
+            .await
     }
 
     pub async fn create(

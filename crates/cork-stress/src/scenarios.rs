@@ -17,6 +17,8 @@ pub enum Scenario {
     Chaos,
     Waiters,
     Soak,
+    /// A fake lead and fake workers through 100 features (HANDOFF 17.5).
+    Lead,
 }
 
 /// Sizes for a run. `scale` shrinks counts and durations for quick runs.
@@ -30,7 +32,7 @@ pub struct Params {
 }
 
 impl Params {
-    fn n(&self, full: usize) -> usize {
+    pub(crate) fn n(&self, full: usize) -> usize {
         ((full as f64 * self.scale).round() as usize).max(1)
     }
 }
@@ -44,13 +46,13 @@ pub struct Report {
 }
 
 impl Report {
-    fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         Self {
             name: name.into(),
             ..Default::default()
         }
     }
-    fn line(&mut self, s: impl Into<String>) {
+    pub(crate) fn line(&mut self, s: impl Into<String>) {
         self.lines.push(s.into());
     }
     fn target(&mut self, strict: bool, ok: bool, what: String) {
@@ -75,7 +77,7 @@ impl Report {
         }
         println!("  {}", if self.passed() { "PASS" } else { "FAIL" });
     }
-    async fn check(&mut self, d: &Daemon) {
+    pub(crate) async fn check(&mut self, d: &Daemon) {
         let c = invariants::check(d).await;
         self.line(format!(
             "invariants: {} events, {} tasks, {} violations",
@@ -94,6 +96,7 @@ pub async fn run(s: Scenario, p: &Params) -> Report {
         Scenario::Chaos => chaos(p).await,
         Scenario::Waiters => waiters(p).await,
         Scenario::Soak => soak(p).await,
+        Scenario::Lead => crate::lead::lead(p).await,
     }
 }
 
