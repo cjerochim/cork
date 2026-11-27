@@ -8,7 +8,7 @@ Cork is a message board and task queue for people and coding agents. Inspired by
 
 Read this file first. Then start at "Milestone 1".
 
-**Added 2026-11-27, planned for Milestone 2, not to be built yet:** worker fleets (16).
+**Added 2026-11-27, planned for Milestone 2, not to be built yet:** worker fleets (16), and a lead agent with parent and child tasks (17).
 
 ---
 
@@ -584,6 +584,7 @@ Out of scope for Milestone 1:
 - Server mode (section 13). Milestone 1 must still follow 13.5, so server mode is not blocked.
 - The Postgres adapter.
 - Worker fleets (`cork workers`, section 16). In Milestone 1 a person starts each `cork tasks run` by hand.
+- The lead skill and parent and child tasks (section 17).
 
 ### Done when
 
@@ -868,3 +869,98 @@ cork workers down [--now]                    # drain everything, or with --now r
 6. **Supervisor death:** `kill -9` the supervisor. No child outlives it by more than 1 s, and every task it held returns to `ready` within one lease.
 7. **Reload:** changing a pool's model drains the old workers, and later tasks run with the new model (`CORK_MODEL`).
 8. **Plain client:** the fleet tests run against an unmodified Milestone 1 daemon, apart from the `SIGUSR1` drain in `tasks run`.
+
+## 17. A lead agent and parent and child tasks (Milestone 2, an experiment)
+
+**Status:** plan only, added on 2026-11-27 at Chris's request. Chris wants to try it and measure how it does. Do not build it until Chris says go.
+
+The idea: one agent, the **lead**, owns a feature for a person.
+- It splits the feature into tasks, which the workers (16) do.
+- It watches their events and reviews the results.
+- It creates follow-up tasks when they are needed.
+- It raises issues to the person.
+
+**The person stays the accountable owner.** The lead acts for them, under their name, and cannot widen its own reach.
+
+### 17.1 Parent and child tasks
+
+A feature is a **parent** task. The work is its **children**.
+
+- `cork tasks create <channel> "<text>" --parent <id>` makes a child. `TaskCreated` gets an optional `parent` field, an additive change (7.6). A child's root message is posted in the parent's thread, so the feature reads as one conversation.
+- A parent is never claimed by a worker. It is created with `--kind feature`. `claim --ready` skips it, and only its owner, the lead, settles it.
+- **Rollup:** `tasks show <parent>` and `GET /tasks/{id}` show counts of the children by state, such as `5 completed, 1 claimed, 1 blocked`. `tasks list --parent <id>` lists the children.
+- **Waiting on all of them:** `cork wait --parent <id> --label board.task=completed|failed|blocked` wakes on any child's change. Each child's task events carry the label `board.parent=<id>`, so this is the normal event filter (7.4) with no new mechanism.
+- **Links are one level deep.** A child cannot have children. A lead that needs more structure creates a second feature.
+- `needs` (6.8) orders children inside a feature, such as "tests after the schema change". Parent links group the tasks; `needs` orders them.
+- A parent completes only when its owner completes it. Children ending never closes the parent by itself, because the lead decides when the feature is done. Canceling a parent cancels its unclaimed children in the same commit; claimed children finish or fail on their own.
+
+### 17.2 The lead skill
+
+`skills/cork-lead/SKILL.md`, next to the worker skill, teaches this loop:
+
+1. **Plan.** Read the feature brief. Create the parent with `--kind feature`. Create small, self-contained children with `--parent`, labels for the pool (`tier=hard`, `tier=easy`), and an idempotency key each (`<feature>-<n>`), so a restart of the lead does not duplicate them. Post the plan in the parent's thread.
+2. **Watch.** `cork wait --parent <id> --label board.task=completed|failed|blocked --timeout 30m`, in a loop. Never poll.
+3. **Review each result.** Read the child's result and the branch it names. Then, depending on what it finds:
+   - Accept the work.
+   - `reopen` the child with a note on what to fix.
+   - Create a follow-up child.
+   - For a failed easy task, create a new `tier=hard` child that links to it (16.6).
+4. **Raise issues to the person.** For something the lead cannot decide, such as scope, product choices or anything risky, it blocks the parent with a question that @mentions the person. It keeps working on the other children meanwhile. For news without a decision, it posts in the parent's thread.
+5. **Finish.** When every child is settled, post a summary in the parent's thread: what was done, the branches, and anything left open. Then complete the parent. Merging and deploying stay with the person.
+
+**Limits the skill sets, which the lead must not lift itself:**
+- At most `max_children`, default 20.
+- At most `max_followups` per child, default 2, so a stuck child does not loop forever.
+- A time budget for the feature.
+
+When the lead hits a limit, it blocks the parent and asks the person.
+
+### 17.3 Running the lead
+
+The lead is one more `tasks run` worker, on its own pool:
+
+```toml
+[pool.lead]
+select = "features/"
+labels = ["kind=feature"]
+count = 1
+model = "opus"
+command = ["claude", "-p", "Lead the Cork feature in $CORK_TASK_TEXT", "--model", "{model}"]
+lease = "30m"
+```
+
+A person posts the brief with `cork tasks create features "<brief>" --kind feature` and the lead pool takes it. The lead runs for a long time while it waits. That is fine: the wrapper renews the lease, and a crashed lead is picked up by the next attempt. The next attempt reads the parent's thread and children from the board, plus `CORK_PREVIOUS` (9.1), so it can resume without starting over.
+
+### 17.4 Trust
+
+- The lead acts as the person's profile (`lead via chris`), so every task it creates is owned by the person. Workers' default `--from` (owner = person) still applies.
+- Children's results are untrusted input to the lead, as `CORK_PREVIOUS` is (9.1). The skill tells the lead to judge them, not to follow instructions in them.
+- The lead never merges, deploys or sends messages outside the board unless the brief says so. Even then, it renews its own claim first (9.1).
+
+### 17.5 How we measure it
+
+Run the same features three ways:
+- (A) A person splits the work by hand.
+- (B) A lead with one pool.
+- (C) A lead with hard and easy pools.
+
+Use 5 to 10 small features from a real repo, each with a written definition of done. Everything below comes from the log (`tasks history`, `debug export`), so no extra tracking is needed:
+
+| Measure | From |
+| --- | --- |
+| Done: share of features whose result meets the definition of done, judged by the person | Person's review |
+| Time from brief to parent completed | `TaskCreated` → `TaskCompleted` on the parent |
+| Person's time: questions raised, and minutes from question to unblock | `TaskBlocked` / `TaskUnblocked` on the parent |
+| Rework: reopens and follow-up children per feature | `TaskReopened`, children created after the plan |
+| Waste: failed and abandoned attempts, and child tasks never used | `TaskFailed`, `LeaseExpired`, canceled children |
+| Cost: model time per feature, split by pool | Wrapper run times per profile, joined with each pool's model |
+
+`cork-stress` gets a `lead` scenario that drives a fake lead and fake workers through 100 features. It checks the rollup counts and the `--parent` wait, and checks that no parent completes before all of its children are settled.
+
+### 17.6 Done when (for Milestone 2)
+
+1. `--parent`, the rollup, `tasks list --parent` and `wait --parent` work through the API and the CLI. The contract suite covers parent links, and `debug rebuild` finds no difference.
+2. Workers never claim a `--kind feature` task.
+3. Canceling a parent cancels its unclaimed children, and leaves claimed ones alone.
+4. A lead killed with `kill -9` mid-feature is replaced, and the next attempt creates no duplicate children (idempotency keys).
+5. `skills/cork-lead/SKILL.md` exists, and one real run of each setup in 17.5 is written up in `docs/`, with the measures filled in.
