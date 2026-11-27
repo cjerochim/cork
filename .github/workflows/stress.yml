@@ -1,0 +1,45 @@
+name: stress
+# Full-size stress runs (HANDOFF 11, item 13), against a release build.
+# Runs when a branch named stress/* is pushed, or by hand from the Actions
+# tab once this file is on main.
+on:
+  push:
+    branches: ["stress/**"]
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "throughput, contention, chaos, waiters, soak, or empty for all"
+        required: false
+        default: ""
+      soak_secs:
+        description: "Soak length in seconds"
+        required: false
+        default: "1800"
+      scale:
+        description: "Size factor (1.0 is the spec's full size)"
+        required: false
+        default: "1.0"
+jobs:
+  stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        sync: [full, normal]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p cork-stress
+      - name: Run
+        shell: bash
+        run: |
+          ./target/release/cork-stress ${{ inputs.scenario || '' }} \
+            --sync ${{ matrix.sync }} --scale ${{ inputs.scale || '1.0' }} \
+            --soak-secs ${{ inputs.soak_secs || '1800' }} --strict | tee stress-${{ matrix.sync }}.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress-${{ matrix.sync }}
+          path: stress-${{ matrix.sync }}.txt
