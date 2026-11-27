@@ -28,6 +28,35 @@ pub struct Model {
     pub cost: Option<f64>,
     /// Declared keywords, aliases already resolved. Tiers not included.
     pub keywords: BTreeSet<String>,
+    /// Dollars per million tokens, for estimating cost when the agent does
+    /// not report it (18.2).
+    pub price: Option<Price>,
+}
+
+/// `[model.<name>.price]`: dollars per million tokens. The real bill is the
+/// provider's; this is an estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Price {
+    #[serde(default)]
+    pub input_per_mtok: f64,
+    #[serde(default)]
+    pub output_per_mtok: f64,
+    #[serde(default)]
+    pub cache_read_per_mtok: f64,
+    #[serde(default)]
+    pub cache_write_per_mtok: f64,
+}
+
+impl Price {
+    /// The estimated cost of these token counts.
+    pub fn cost(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
+        (input as f64 * self.input_per_mtok
+            + output as f64 * self.output_per_mtok
+            + cache_read as f64 * self.cache_read_per_mtok
+            + cache_write as f64 * self.cache_write_per_mtok)
+            / 1_000_000.0
+    }
 }
 
 impl Model {
@@ -93,6 +122,7 @@ struct RawModel {
     cost: Option<f64>,
     #[serde(default)]
     keywords: Vec<String>,
+    price: Option<Price>,
 }
 
 fn one() -> u32 {
@@ -193,6 +223,18 @@ impl Catalog {
             {
                 return Err(format!("model `{name}`: cost must be a number >= 0"));
             }
+            if let Some(p) = &m.price
+                && [
+                    p.input_per_mtok,
+                    p.output_per_mtok,
+                    p.cache_read_per_mtok,
+                    p.cache_write_per_mtok,
+                ]
+                .iter()
+                .any(|v| !(v.is_finite() && *v >= 0.0))
+            {
+                return Err(format!("model `{name}`: prices must be numbers >= 0"));
+            }
             let mut keywords = BTreeSet::new();
             for k in &m.keywords {
                 // A model names keywords, not tiers: its tier says that.
@@ -214,6 +256,7 @@ impl Catalog {
                     tier: m.tier,
                     cost: m.cost,
                     keywords,
+                    price: m.price,
                 },
             );
         }
@@ -402,6 +445,11 @@ tier = 2
 cost = 3
 keywords = ["rust", "ts", "docs", "large-context"]
 
+[model.sonnet.price]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+cache_read_per_mtok = 0.3
+
 [model.haiku]
 command = ["claude", "-p", "x", "--model", "haiku"]
 tier = 1
@@ -433,6 +481,11 @@ mod tests {
         assert!(!s.covers().contains("tier-3"));
         assert!(c.models["haiku"].keywords.contains("docs"));
         assert_eq!(c.models["reviewer"].cost, None);
+        let p = c.models["sonnet"].price.unwrap();
+        assert_eq!(p.input_per_mtok, 3.0);
+        assert_eq!(p.cache_write_per_mtok, 0.0);
+        assert!((p.cost(1_000_000, 100_000, 0, 0) - 4.5).abs() < 1e-9);
+        assert_eq!(c.models["haiku"].price, None);
     }
 
     #[test]

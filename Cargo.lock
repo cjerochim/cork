@@ -288,6 +288,7 @@ dependencies = [
  "cork-core",
  "cork-fleet",
  "cork-server",
+ "cork-stats",
  "cork-store",
  "cork-store-sqlite",
  "hex",
@@ -357,6 +358,15 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+]
+
+[[package]]
+name = "cork-stats"
+version = "0.1.0"
+dependencies = [
+ "cork-api",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

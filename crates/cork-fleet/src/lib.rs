@@ -10,6 +10,6 @@ pub mod escalation;
 pub mod routing;
 pub mod supervisor;
 
-pub use catalog::{Catalog, Model, Needs, UnknownKeyword};
+pub use catalog::{Catalog, Model, Needs, Price, UnknownKeyword};
 pub use config::{Fleet, Pool};
 pub use routing::{TaskFacts, Verdict};

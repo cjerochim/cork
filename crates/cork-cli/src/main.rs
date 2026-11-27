@@ -3,6 +3,7 @@
 mod escalate;
 mod run;
 mod serve;
+mod stats;
 mod usage;
 mod workers;
 
@@ -130,6 +131,34 @@ enum Cmd {
     Workers {
         #[command(subcommand)]
         cmd: WorkersCmd,
+    },
+    /// Flow, usage and cost per successful task, from the log (HANDOFF 18.3).
+    Stats {
+        /// Only tasks created in this last stretch, such as 7d.
+        #[arg(long, value_parser = parse_duration)]
+        since: Option<Duration>,
+        /// Only these channels, such as work/.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Only tasks with this label (k=v); repeatable.
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        /// Only this feature task and its children (`parent=<id>`).
+        #[arg(long)]
+        feature: Option<String>,
+        /// model, pool, profile, channel, label:<key> or day.
+        #[arg(long, default_value = "model")]
+        by: cork_stats::By,
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
+        /// Also show failure reasons, grouped by their first line.
+        #[arg(long)]
+        reasons: bool,
+        /// Read an export instead of asking the daemon.
+        #[arg(long, value_name = "EXPORT")]
+        file: Option<PathBuf>,
+        #[command(flatten)]
+        files: FleetFiles,
     },
     /// Manage the daemon's token.
     Token {
@@ -387,7 +416,8 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         "" | "s" => n * 1_000.0,
         "m" => n * 60_000.0,
         "h" => n * 3_600_000.0,
-        _ => return Err(format!("bad duration `{s}`: use 500ms, 30s, 5m or 2h")),
+        "d" => n * 86_400_000.0,
+        _ => return Err(format!("bad duration `{s}`: use 500ms, 30s, 5m, 2h or 7d")),
     };
     Ok(Duration::from_millis(ms as u64))
 }
@@ -559,13 +589,53 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
         _ => {}
     }
 
+    if let Cmd::Stats {
+        since,
+        channel,
+        labels,
+        feature,
+        by,
+        csv,
+        reasons,
+        file,
+        files,
+    } = &cli.cmd
+    {
+        let mut ls = vec![];
+        for l in labels {
+            let (k, v) = l
+                .split_once('=')
+                .ok_or_else(|| usage(format!("--label wants k=v, not `{l}`")))?;
+            ls.push((k.to_string(), v.to_string()));
+        }
+        let o = stats::StatsOpts {
+            since: *since,
+            channel: channel.clone(),
+            labels: ls,
+            feature: feature.clone(),
+            by: by.clone(),
+            json: cli.json,
+            csv: *csv,
+            reasons: *reasons,
+            file: file.clone(),
+            models: files.models.clone(),
+            config: files.config.clone(),
+        };
+        if file.is_some() {
+            return stats::stats(&home, None, o).await;
+        }
+        let conn = Connect::from_env(cli.profile.clone());
+        let client = home::connect(&conn).await?;
+        return stats::stats(&home, Some(&client), o).await;
+    }
+
     let conn = Connect::from_env(cli.profile.clone());
     let client = home::connect(&conn).await?;
     let key = cli.idempotency_key.as_deref();
     let json = cli.json;
 
     match cli.cmd {
-        Cmd::Serve { .. } | Cmd::Token { .. } => unreachable!(),
+        Cmd::Serve { .. } | Cmd::Token { .. } | Cmd::Stats { .. } => unreachable!(),
         Cmd::Debug {
             cmd: DebugCmd::Rebuild { .. },
         }
