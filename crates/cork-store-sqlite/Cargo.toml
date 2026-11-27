@@ -1,0 +1,21 @@
+[package]
+name = "cork-store-sqlite"
+description = "SQLite adapter for the Cork storage contract: WAL, one writer thread, a pool of readers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+cork-core = { path = "../cork-core", version = "0.1.0" }
+cork-store = { path = "../cork-store", version = "0.1.0" }
+rusqlite = { version = "0.43", features = ["bundled"] }
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[dev-dependencies]
+cork-store = { path = "../cork-store", features = ["testkit"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
