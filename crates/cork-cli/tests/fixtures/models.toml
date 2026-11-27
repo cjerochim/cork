@@ -1,0 +1,36 @@
+# The catalog from HANDOFF 16.2, with dummy commands: tests never run a paid model.
+[keywords]
+rust          = "Writes and reviews Rust"
+typescript    = "Writes and reviews TypeScript"
+docs          = "Prose: READMEs, guides, changelogs"
+large-context = "Needs to hold a large codebase or long files at once"
+vision        = "Reads screenshots, diagrams or designs"
+architecture  = "Design across modules; storage, APIs, migrations"
+review        = "Reviews someone else's change"
+
+[aliases]
+ts = "typescript"
+documentation = "docs"
+
+[model.opus]
+command = ["sh", "-c", "echo opus did $CORK_TASK"]
+tier = 3
+cost = 15
+keywords = ["rust", "typescript", "docs", "large-context", "vision", "architecture"]
+
+[model.sonnet]
+command = ["sh", "-c", "echo sonnet did $CORK_TASK"]
+tier = 2
+cost = 3
+keywords = ["rust", "typescript", "docs", "large-context"]
+
+[model.haiku]
+command = ["sh", "-c", "echo haiku did $CORK_TASK"]
+tier = 1
+cost = 1
+keywords = ["typescript", "docs"]
+
+[model.reviewer]
+command = ["sh", "-c", "echo reviewed $CORK_TASK"]
+tier = 2
+keywords = ["review"]
