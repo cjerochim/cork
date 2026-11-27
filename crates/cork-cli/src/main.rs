@@ -459,12 +459,12 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
                     print_json(&v);
                 } else {
                     let t: ThreadOut = serde_json::from_value(v).map_err(internal)?;
-                    print_message(&t.root);
+                    print_message(&t.root, true);
                     if let Some(task) = &t.task {
                         println!("  task: {}", task.state.as_str());
                     }
                     for r in &t.replies {
-                        print_message(r);
+                        print_message(r, true);
                     }
                 }
             } else {
@@ -481,7 +481,7 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
                     let mut page: MessagesPage = serde_json::from_value(v).map_err(internal)?;
                     page.messages.sort_by_key(|m| m.position);
                     for m in &page.messages {
-                        print_message(m);
+                        print_message(m, false);
                     }
                 }
             }
@@ -577,10 +577,12 @@ async fn wait(
     timeout: Duration,
     json: bool,
 ) -> Result<i32, ClientError> {
-    let mut p = vec![
-        target_param(target),
-        ("type", cork_core::message::MESSAGE_POSTED.to_string()),
-    ];
+    let mut p = vec![target_param(target)];
+    // A wait is for messages, except a wait on a task state such as
+    // `board.task=completed`, which matches the task's own events.
+    if !labels.iter().any(|l| l.starts_with("board.task=")) {
+        p.push(("type", cork_core::message::MESSAGE_POSTED.to_string()));
+    }
     p.extend(labels.iter().map(|l| ("label", l.clone())));
     if mentions {
         p.push(("mentions", "true".into()));
@@ -1005,7 +1007,7 @@ fn fmt_time(ms: i64) -> String {
     )
 }
 
-fn print_message(m: &MessageOut) {
+fn print_message(m: &MessageOut, in_thread: bool) {
     let m2 = &m.message;
     let labels: Vec<String> = m2.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let labels = if labels.is_empty() {
@@ -1014,8 +1016,15 @@ fn print_message(m: &MessageOut) {
         format!(" [{}]", labels.join(" "))
     };
     let indent = if m2.parent.is_some() { "  " } else { "" };
+    // In a channel listing, a reply says which thread it belongs to.
+    let thread = if m2.parent.is_some() && !in_thread {
+        format!(" (reply in {})", m2.thread_id)
+    } else {
+        String::new()
+    };
+    let indent = if in_thread { indent } else { "" };
     println!(
-        "{indent}{} {} {} in {}{labels}",
+        "{indent}{} {} {} in {}{thread}{labels}",
         m2.id,
         fmt_time(m2.at),
         m2.actor,
@@ -1053,7 +1062,14 @@ fn print_task(t: &TaskOut) {
     for (label, v) in [
         ("result", &k.result),
         ("reason", &k.reason),
-        ("question", &k.question),
+        (
+            "question",
+            if k.state == cork_core::TaskState::Blocked {
+                &k.question
+            } else {
+                &None
+            },
+        ),
     ] {
         if let Some(v) = v {
             println!("  {label}: {v}");
