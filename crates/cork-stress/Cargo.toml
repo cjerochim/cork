@@ -1,0 +1,23 @@
+[package]
+name = "cork-stress"
+description = "Stress tests for Cork: throughput, contention, chaos, waiters and soak, with log invariants."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+cork-api = { path = "../cork-api" }
+cork-core = { path = "../cork-core" }
+cork-server = { path = "../cork-server" }
+cork-store = { path = "../cork-store" }
+cork-store-sqlite = { path = "../cork-store-sqlite" }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
