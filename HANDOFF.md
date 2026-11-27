@@ -219,7 +219,7 @@ It covers: atomic writes (a failing `f` writes nothing), each expected-version g
 
 | State | Meaning |
 | --- | --- |
-| `waiting` | Waiting on tasks: at least one task it depends on has not completed, nor a task that replaced it (6.8, planned) |
+| `waiting` | Waiting on tasks: at least one task it depends on has not completed, nor a task that replaced it (6.8) |
 | `ready` | It can be claimed |
 | `claimed` | A worker holds it until its lease ends |
 | `blocked` | It is held for a person |
@@ -240,7 +240,7 @@ It covers: atomic writes (a failing `f` writes nothing), each expected-version g
 
 ### 6.3 Task events
 
-`TaskCreated`, `TaskClaimed`, `LeaseRenewed`, `LeaseExpired`, `TaskReleased`, `TaskCompleted`, `TaskFailed`, `TaskBlocked`, `TaskUnblocked`, `TaskCanceled`, `TaskReopened`. For dependencies (6.8, planned): `TaskReplaced`, `DependenciesMet`, `DependencyFailed`, and `DependenciesChanged`, reserved now so the log format is stable. (`DependenciesChanged` was reserved as `NeedsChanged` until 6.8 was written; no log holds it.)
+`TaskCreated`, `TaskClaimed`, `LeaseRenewed`, `LeaseExpired`, `TaskReleased`, `TaskCompleted`, `TaskFailed`, `TaskBlocked`, `TaskUnblocked`, `TaskCanceled`, `TaskReopened`. For dependencies (6.8): `TaskReplaced`, `DependenciesMet` and `DependencyFailed`, and `DependenciesChanged`, reserved and never written. (`DependenciesChanged` was reserved as `NeedsChanged` until 6.8 was written; no log holds it.)
 
 Each task event carries the index label `board.task=<state after the event>`, plus its channel and its thread (the task id). A filter on a user label, such as `step=fix`, matches task events by joining to `task_labels`. So `wait work/ --label step=fix --label board.task=completed` works without copying labels onto every event.
 
@@ -300,9 +300,9 @@ Either way, the log always holds a `LeaseExpired` between one claim and the next
 
 Anyone else gets `task_not_owned`. A wrong starting state gets `invalid_state`. All four are in core, the API and the CLI in Milestone 1.
 
-### 6.8 Dependencies (planned, not built)
+### 6.8 Dependencies
 
-**Status (2026-11-27):** signed off by Chris. That covers the core rules, dependencies fixed at creation, replacement declared, not edited in (6.8.3), and both decisions in 6.8.10. Nothing here is built. The build waits for Chris to say go, and Chris picks the milestone.
+**Status (2026-11-27):** signed off by Chris, who said go the same day. Built in two parts. **Part one** (the writes): core rules, events, the dependency index, the writer's rule in every commit, `POST /tasks` with `depends_on` and `replaces`, and `cork tasks create --after / --replaces`. **Part two** (the reads and the lead): `show`, `list --waiting-on / --stuck`, results passed to the dependent (Decision 2), plan files (6.8.8), `tasks escalate` with `--replaces`, and the stress invariants.
 
 **Why it is in the core.** Readiness is the board's call, so dependencies are too. A worker or a client cannot decide that a task is ready, the same way it cannot decide that a lease is live (3). Keyword routing (16) stays out of the core because it only chooses *which* worker takes a ready task. Dependencies decide *whether* a task is ready at all.
 
@@ -360,7 +360,7 @@ Schema 1 of `TaskCreated` and `TaskReopened` upcasts to empty lists and no `repl
 #### 6.8.5 What each command does
 
 - **Create** with `depends_on`: every id must be a task on this board (`not_found` otherwise). At most 64 dependencies per task (`invalid_input`). Duplicates are dropped. A dependency may be in any channel and any state, including replaced (it then resolves to its head). If every head is `completed`, the task starts `ready`.
-- **Complete** a task `Y`: in the same commit, for each waiting task with a dependency whose head is `Y`, and whose dependencies are now *all* met, append `DependenciesMet { met_by: Y }`. Dependents are visited in task id order, so the commit is deterministic. A replayed `complete` (6.4) writes nothing, so nothing readies twice. Readying a task counts as "makes a task ready" for the waiting-claim queue (6.5), which hands it out in the same transaction.
+- **Complete** a task `Y`: in the same commit, for each waiting task with a dependency whose head is `Y`, and whose dependencies are now *all* met, append `DependenciesMet { met_by: Y }`. Dependents are visited oldest first (`created_position`), so the commit is deterministic and tasks readied together reach waiting claims in queue order (6.5). A replayed `complete` (6.4) writes nothing, so nothing readies twice. Readying a task counts as "makes a task ready" for the waiting-claim queue (6.5), which hands it out in the same transaction.
 - **Fail or cancel** a task that is the head of some waiting task's dependency (including `TaskFailed` after the last lease, 6.6, whether a decision or the lease timer writes it): the dependents stay `waiting`. See Decision 1 for how that is surfaced.
 - **Replace** a task: as in 6.8.3. Its dependents now resolve to the retry, so nothing is readied or failed by the replacement itself.
 - **Reopen a dependency** `Y`: dependents that are already `ready` or further along are not touched. The board never moves a task back into `waiting`. Dependents still waiting count `Y` as unmet again, so they ready only when `Y` completes again.
@@ -380,9 +380,9 @@ Schema 1 of `TaskCreated` and `TaskReopened` upcasts to empty lists and no `repl
   );
   CREATE INDEX task_dependencies_by_dependency ON task_dependencies (depends_on, task_id);
 
-  ALTER TABLE tasks ADD COLUMN replaced_by TEXT;   -- set by TaskReplaced
-  ALTER TABLE tasks ADD COLUMN replaces    TEXT;   -- set by TaskCreated
   ```
+
+  `replaces` and `replaced_by` live in each task's stored body, not in columns: every lookup of them is by task id, so no index is needed, and existing databases need no migration.
 
 - **Completing `Y`** walks `replaces` back from `Y` (at most 16 steps) to collect every id that resolves to `Y`, reads the waiting dependents of those ids through the index, then resolves each dependent's other dependencies forward through `replaced_by`. This is bounded by 64 dependencies of at most 16 steps each. Many dependents on one task (fan-out) cost one row each, all in one commit.
 - `debug rebuild` rebuilds both from `TaskCreated` and `TaskReplaced` events, and checks them like every other projection.

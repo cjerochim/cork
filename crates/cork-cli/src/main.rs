@@ -303,6 +303,14 @@ enum TaskCmd {
         /// The model catalog for --needs.
         #[arg(long, value_name = "FILE")]
         models: Option<PathBuf>,
+        /// Wait for this task to complete first (or whatever replaced it).
+        /// Repeat it, or give ids separated by commas.
+        #[arg(long, value_delimiter = ',', value_name = "ID")]
+        after: Vec<String>,
+        /// This task is a retry that takes over <ID>'s place: it inherits
+        /// <ID>'s dependencies, and tasks waiting on <ID> now wait on it.
+        #[arg(long, value_name = "ID", conflicts_with = "after")]
+        replaces: Option<String>,
     },
     Claim {
         id: Option<String>,
@@ -989,6 +997,8 @@ async fn tasks(
             assignee,
             needs,
             models,
+            after,
+            replaces,
         } => {
             let mut labels = parse_labels(&m.labels)?;
             if !needs.is_empty() {
@@ -1003,6 +1013,8 @@ async fn tasks(
                 lease_ms: ms(lease),
                 max_attempts,
                 assignee,
+                depends_on: after,
+                replaces,
             };
             let v = client.create_task(&req, key).await?;
             if json {

@@ -60,6 +60,7 @@ pub async fn escalate(
         lease_ms: Some(t.task.lease_ms),
         max_attempts: Some(t.task.max_attempts),
         assignee: None,
+        ..Default::default()
     };
     let v = client.create_task(&req, Some(&key)).await?;
     let new = v["task"]["id"].as_str().unwrap_or_default().to_string();

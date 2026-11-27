@@ -47,6 +47,7 @@ macro_rules! contract_tests {
             max_at_and_head,
             task_events_match_task_labels,
             import_keeps_positions,
+            dependency_projection,
         );
     };
     (@each $make:expr; $($name:ident),* $(,)?) => {
@@ -204,13 +205,26 @@ pub async fn create_task<S: Store>(
     input: CreateTask,
     now: Millis,
 ) -> Task {
+    create_task_with(s, channel, task_labels, input, Default::default(), now).await
+}
+
+/// As [`create_task`], with resolved dependencies (HANDOFF 6.8).
+pub async fn create_task_with<S: Store>(
+    s: &S,
+    channel: &str,
+    task_labels: Labels,
+    input: CreateTask,
+    deps: cork_core::deps::Resolved,
+    now: Millis,
+) -> Task {
     let m = root(channel, "do it", task_labels.clone(), now);
-    let created = Task::create(
+    let created = Task::create_with(
         m.id.clone(),
         channel,
         &Actor::person("chris"),
         task_labels,
         &input,
+        deps,
     )
     .unwrap();
     let task = Task::genesis(&created, now).unwrap();
@@ -1412,4 +1426,96 @@ pub async fn import_keeps_positions<S: Store>(s: Arc<S>) {
     assert_eq!(out[0].position, 4);
     // Import only goes into an empty store.
     assert!(s.import(log).await.is_err());
+}
+
+// ---------- dependencies (HANDOFF 6.8.6) ----------
+
+pub async fn dependency_projection<S: Store>(s: Arc<S>) {
+    use cork_core::deps::Resolved;
+    let a = create_task(&*s, "work", Labels::new(), lease(1_000, 1), 10).await;
+    let b = create_task(&*s, "work", Labels::new(), lease(1_000, 1), 10).await;
+    let waits = |ids: &[&Task]| Resolved {
+        depends_on: ids.iter().map(|t| t.id.clone()).collect(),
+        replaces: None,
+        open: ids.iter().map(|t| t.id.clone()).collect(),
+    };
+    let c = create_task_with(
+        &*s,
+        "work",
+        Labels::new(),
+        lease(1_000, 1),
+        waits(&[&a, &b]),
+        11,
+    )
+    .await;
+    let d = create_task_with(
+        &*s,
+        "other",
+        Labels::new(),
+        lease(1_000, 1),
+        waits(&[&a]),
+        12,
+    )
+    .await;
+    assert_eq!(c.state, TaskState::Waiting);
+    assert_eq!(s.get_task(&c.id).await.unwrap().unwrap().task, c);
+
+    // Dependents of any of the ids, oldest first, no repeats.
+    assert_eq!(
+        s.dependents(std::slice::from_ref(&a.id)).await.unwrap(),
+        [c.id.clone(), d.id.clone()]
+    );
+    assert_eq!(
+        s.dependents(&[b.id.clone(), a.id.clone()]).await.unwrap(),
+        [c.id.clone(), d.id.clone()]
+    );
+    assert!(
+        s.dependents(std::slice::from_ref(&c.id))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (_, inside) = s
+        .write({
+            let b = b.id.clone();
+            move |tx| Ok((Commit::default(), tx.dependents(&[b])?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(inside, vec![c.id.clone()]);
+
+    // `waiting` is a state like any other in queries; never ready.
+    let q = |state| TaskQuery {
+        state: Some(state),
+        limit: 10,
+        now: 1_000_000,
+        ..Default::default()
+    };
+    let waiting: Vec<String> = s
+        .list_tasks(&q(TaskState::Waiting))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.task.id)
+        .collect();
+    assert_eq!(waiting, [c.id.clone(), d.id.clone()]);
+    let ready: Vec<String> = s
+        .list_tasks(&q(TaskState::Ready))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.task.id)
+        .collect();
+    assert_eq!(ready, [a.id.clone(), b.id.clone()]);
+    // Updates keep the index: the declared ids never change.
+    let c2 = decide(&*s, &c.id, 20, |t| {
+        t.cancel(20, &Actor::person("chris"), None)
+    })
+    .await
+    .unwrap();
+    assert_eq!(c2.depends_on, c.depends_on);
+    assert_eq!(
+        s.dependents(std::slice::from_ref(&b.id)).await.unwrap(),
+        vec![c.id.clone()]
+    );
 }
