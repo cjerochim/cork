@@ -10,6 +10,8 @@ Read this file first. Then start at "Milestone 1".
 
 **Added 2026-11-27, planned for Milestone 2, not to be built yet:** worker fleets with keyword routing (16), and a lead agent with parent and child tasks (17). **Planned for Milestone 3:** observability of performance, cost and usage (18).
 
+**Added 2026-11-27, planned, not built:** task dependencies and the `waiting` state, in the core (6.8). Its three open proposals are for Chris to review (6.8.9).
+
 ---
 
 ## 0. What changed in v3
@@ -217,7 +219,7 @@ It covers: atomic writes (a failing `f` writes nothing), each expected-version g
 
 | State | Meaning |
 | --- | --- |
-| `waiting` | A task it needs has not completed (Milestone 2) |
+| `waiting` | Waiting on tasks: at least one task it depends on has not completed (6.8, planned) |
 | `ready` | It can be claimed |
 | `claimed` | A worker holds it until its lease ends |
 | `blocked` | It is held for a person |
@@ -238,7 +240,7 @@ It covers: atomic writes (a failing `f` writes nothing), each expected-version g
 
 ### 6.3 Task events
 
-`TaskCreated`, `TaskClaimed`, `LeaseRenewed`, `LeaseExpired`, `TaskReleased`, `TaskCompleted`, `TaskFailed`, `TaskBlocked`, `TaskUnblocked`, `TaskCanceled`, `TaskReopened`, `NeedsChanged` (Milestone 2, reserved now so the log format is stable).
+`TaskCreated`, `TaskClaimed`, `LeaseRenewed`, `LeaseExpired`, `TaskReleased`, `TaskCompleted`, `TaskFailed`, `TaskBlocked`, `TaskUnblocked`, `TaskCanceled`, `TaskReopened`. For dependencies (6.8, planned): `DependenciesMet`, `DependencyFailed`, and `DependenciesChanged`, reserved now so the log format is stable. (`DependenciesChanged` was reserved as `NeedsChanged` until 6.8 was written; no log holds it.)
 
 Each task event carries the index label `board.task=<state after the event>`, plus its channel and its thread (the task id). A filter on a user label, such as `step=fix`, matches task events by joining to `task_labels`. So `wait work/ --label step=fix --label board.task=completed` works without copying labels onto every event.
 
@@ -276,7 +278,7 @@ Either way, the log always holds a `LeaseExpired` between one claim and the next
 
 `claim --ready <selector>` with optional labels and `--from <owner>`. In one write transaction, take the **oldest** task whose effective state is `ready` and that matches the selector, labels, owner and assignee (`ORDER BY created_position LIMIT 1`). Claim it as in 6.4. If there is none, the outcome is `nothing_ready`.
 
-**With `--wait <d>`.** The server keeps a first-come, first-served queue of waiting claims, each with its filter. After any commit that makes a task ready (create, release, unblock, reopen, lease end), the writer hands each newly ready task to the oldest waiting claim that matches it, in the same transaction. A waiter is never starved by a newer one. When the wait runs out, the outcome is `timeout`.
+**With `--wait <d>`.** The server keeps a first-come, first-served queue of waiting claims, each with its filter. After any commit that makes a task ready (create, release, unblock, reopen, lease end, and dependencies met, 6.8), the writer hands each newly ready task to the oldest waiting claim that matches it, in the same transaction. A waiter is never starved by a newer one. When the wait runs out, the outcome is `timeout`.
 
 `--from`: by default a worker only takes tasks the caller's person owns (10). `--from <person>` takes another owner's tasks. `--from '*'` takes anyone's.
 
@@ -298,13 +300,177 @@ Either way, the log always holds a `LeaseExpired` between one claim and the next
 
 Anyone else gets `task_not_owned`. A wrong starting state gets `invalid_state`. All four are in core, the API and the CLI in Milestone 1.
 
-### 6.8 Dependencies (Milestone 2)
+### 6.8 Dependencies (planned, not built)
 
-- `needs` lists tasks that must complete first. A task with unmet needs is `waiting`.
-- When a task completes, ready the tasks that waited only for it, in the same commit.
-- A failed or canceled prerequisite readies nothing.
-- Only the owner can change needs, and only while the task is unclaimed and not finished.
-- Plans from JSON (`tasks create <channel> --file plan.json`) with keys, needs by key, and an idempotency key.
+**Status (2026-11-27):** the core rules below are agreed with Chris. The three items marked **Proposal** are not confirmed yet and are for Chris to review (6.8.9). Nothing here is built. Chris picks the milestone.
+
+**Why it is in the core.** Readiness is the board's call, so dependencies are too. A worker or a client cannot decide that a task is ready, the same way it cannot decide that a lease is live (3). Keyword routing (16) stays out of the core because it only chooses *which* worker takes a ready task. Dependencies decide *whether* a task is ready at all.
+
+#### 6.8.1 The rule
+
+- A task may declare that it **depends on** other tasks: `depends_on`, a list of task ids on the same board.
+- **`waiting`** ("waiting on tasks") means one thing only: the task has at least one dependency that is not `completed`. It has no other reason.
+- A waiting task is never offered to a worker. `claim --ready` skips it, the waiting-claim queue (6.5) never gets it, and the fleet dispatcher (16.4) never sees it, because it only lists ready tasks.
+- **Only the board moves a task out of `waiting`.** When the last open dependency completes, the board writes `DependenciesMet` on the waiting task, in the same commit as that `TaskCompleted`. The task is then `ready`. No command lets a person or agent move it there by hand.
+- **`waiting` is not `blocked`.** `blocked` keeps its meaning: an agent asked a person something and is held until a person unblocks it. A task can never be both. A waiting task has never been claimed in its current period, and only a claimed task can be blocked.
+
+**Other hold reasons are out of scope.** A scheduled start ("not before 9 am"), a manual hold, or a quota could later be reasons to hold a task back too. They would get their own state or field, not a second meaning for `waiting`. They are noted here only so the name stays free of them.
+
+#### 6.8.2 Naming: `depends_on` and `--after`
+
+The field is `depends_on` and the CLI flag is `--after`. The word `needs` is not used for dependencies, because `--needs` and the `needs.<keyword>` labels already mean model keywords (16.6, built in Milestone 2). This settles the naming note in 16.6: the keyword labels keep `needs.`.
+
+The reserved event `NeedsChanged` (6.3) has never been written to any log, since nothing emits it. It is renamed `DependenciesChanged` before dependencies ship, and stays reserved (6.8.9, Proposal 2).
+
+#### 6.8.3 Events
+
+`DependenciesMet` and `DependencyFailed` are written by the system actor `cork`. `TaskCreated` and `TaskReopened` keep their usual actors.
+
+| Event | On which stream | Data | `board.task` after |
+| --- | --- | --- | --- |
+| `TaskCreated` (schema 2) | the new task | adds `depends_on: [id]` and `open_dependencies: [id]`, the subset not `completed` at create time | `waiting` if `open_dependencies` is not empty, else `ready` |
+| `DependenciesMet` | each dependent that this commit readies | `{ last: <id of the dependency whose completion readied it> }` | `ready` |
+| `DependencyFailed` (Proposal 1) | each waiting dependent | `{ dependency: <id>, state: "failed" \| "canceled", reason? }` | `waiting` (unchanged) |
+| `TaskReopened` (schema 2) | the reopened task | adds `open_dependencies: [id]`, decided at reopen time | `waiting` if not empty, else `ready` |
+| `DependenciesChanged` | reserved, not written (Proposal 2) | | |
+
+Schema 1 of `TaskCreated` and `TaskReopened` upcasts to empty lists, so every log written by Milestone 1 and 2 reads unchanged.
+
+**Why the create and reopen events carry `open_dependencies`.** A task's state must come from folding its own stream alone, as it does today (6.3, 8.2). Whether a new task starts `waiting` depends on other tasks' states, so the writer decides it and records the answer in the event. Replay, `show --at` and `debug rebuild` then never read another stream to fold a task.
+
+#### 6.8.4 What each command does
+
+- **Create** with `depends_on`: every id must be a task on this board (`not_found` otherwise). At most 64 dependencies per task (`invalid_input`). Duplicates are dropped. A dependency may be in any channel and any state. If all are `completed`, the task starts `ready`.
+- **Complete** a task `A`: in the same commit, for each task waiting on `A` whose dependencies are now *all* `completed`, append `DependenciesMet { last: A }`. Dependents are visited in task id order, so the commit is deterministic. A replayed `complete` (6.4) writes nothing, so it never readies anything twice. Readying a task counts as "makes a task ready" for the waiting-claim queue (6.5), which hands it out in the same transaction.
+- **Fail or cancel** a dependency (including `TaskFailed` after the last lease, 6.6, whether a decision or the lease timer writes it): the dependents stay `waiting`. See Proposal 1 for what is surfaced.
+- **Reopen a dependency** `A`: dependents that are already `ready` or further along are not touched. The board never moves a task back into `waiting`. Dependents still waiting count `A` as open again, so they ready only when `A` completes again.
+- **Reopen a dependent:** the writer checks its dependencies again and records `open_dependencies` on `TaskReopened`. It goes to `waiting` or `ready`.
+- **Claim by id** of a waiting task: `invalid_state`, with a message that names the open dependencies. **Cancel** works on a waiting task, as on any non-terminal task. `block`, `unblock` and the settles never apply, because a waiting task has no claim.
+- **Effective state** (5.3) is unchanged: `waiting` has no lease to end.
+
+#### 6.8.5 Storage
+
+- A projection table, written in the same transaction as the events:
+
+  ```sql
+  CREATE TABLE task_dependencies (
+    task_id    TEXT NOT NULL,   -- the dependent
+    depends_on TEXT NOT NULL,   -- the dependency
+    PRIMARY KEY (task_id, depends_on)
+  );
+  CREATE INDEX task_dependencies_by_dependency ON task_dependencies (depends_on, task_id);
+  ```
+
+- `complete` reads the waiting dependents of `A` through the index, then the states of their dependencies. This is bounded by 64 per dependent. Many dependents on one task (fan-out) cost one row each, all in one commit.
+- `debug rebuild` rebuilds the table from `TaskCreated` events, and checks it like every other projection.
+- The contract suite (5.4) adds: the table follows the log, dependents by dependency, and ready-queue order when many tasks ready in one commit (oldest `created_position` first, as in 6.5).
+
+#### 6.8.6 API and CLI
+
+| Where | Change |
+| --- | --- |
+| `POST /tasks` | Optional `depends_on: [id]` |
+| `POST /tasks/plan` | Many tasks in one commit (6.8.7) |
+| `GET /tasks/{id}` | Adds `depends_on` with each dependency's id, effective state and `completed_at`, and `dependents` (ids and states) |
+| `GET /tasks` | Adds `waiting_on=<id>`: the tasks that depend on that task |
+| `POST /tasks/claim` | When `claimed`, the body adds `dependencies` (Proposal 3) |
+
+All of these are additive, as 7.6 requires.
+
+```bash
+cork tasks create <channel> "<text>" --after <id> [--after <id>]...   # or --after id1,id2
+cork tasks create <channel> --file plan.json                          # 6.8.7
+cork tasks list [--state waiting] [--waiting-on <id>]
+cork tasks show <id>          # "Waiting on: A (completed), C (claimed)" and "Needed by: …"
+cork wait work/ --type DependenciesMet --type DependencyFailed
+```
+
+`--after` takes ids only. In a plan file, tasks refer to each other by key.
+
+#### 6.8.7 Plans from a file
+
+```json
+{
+  "idempotency_key": "feature-F-plan-1",
+  "tasks": [
+    { "key": "schema", "text": "Add the column", "labels": { "parent": "F" } },
+    { "key": "tests",  "text": "Tests for the column", "after": ["schema"] },
+    { "key": "docs",   "text": "Document it", "after": ["schema", "01JD…existing id"] }
+  ]
+}
+```
+
+- `after` names keys in the same file or ids of existing tasks.
+- The whole plan is one commit, so the lead never sees half a plan.
+- Keys must be unique, and the keys in the file must not form a cycle. That is the only cycle check in this design (6.8.8). A cycle or an unknown key is `invalid_input`, naming them, and nothing is written.
+- Each task's `--needs` keywords, `--for`, lease and attempts work as in `tasks create`. The plan's idempotency key covers the whole plan.
+
+#### 6.8.8 Invariants and replay
+
+Cycles cannot happen while dependencies are set only at creation (Proposal 2). A new task can only depend on tasks that already exist, and nothing can come to depend on it later. So every edge points to an older task, and the graph is acyclic by construction. A plan file is checked as a whole before its commit.
+
+`cork-stress` checks these from the log after every run, beside the invariants in 11:
+
+1. After `TaskCreated` or `TaskReopened`, a task is `waiting` exactly when `open_dependencies` is not empty, and each id there was not `completed` at that position.
+2. A task leaves `waiting` only by `DependenciesMet` or `TaskCanceled`. Each `DependenciesMet { last: A }` shares a commit with a `TaskCompleted` of `A`, and at that commit every dependency of the task is `completed`.
+3. **Nothing is stuck by the board.** At every commit boundary, no task is `waiting` while all its dependencies are `completed`.
+4. No `TaskClaimed` while a task is `waiting`.
+5. (Proposal 1) For each `TaskFailed` or `TaskCanceled` of a task, every task then waiting on it has exactly one `DependencyFailed` naming it, in the same commit.
+6. Every `depends_on` id has a lower `created_position` than the task, or is in the same plan commit with no cycle.
+7. Folding each task's stream alone gives the stored state. The fold never reads another stream.
+
+Done when, beside 6.8.4's unit tests in `cork-core`:
+
+- **Fan-in:** a task waiting on 64 tasks, completed by 20 workers at once, readies exactly once, in the commit of the last completion.
+- **Fan-out:** 1,000 tasks waiting on one task all ready in its completion commit. Claims waiting before it are served first come, first served.
+- **Chain:** a chain of 100 tasks run by 10 workers completes in order, and no task is ever claimed before its dependency completed.
+- **Chaos:** the chaos stress run (11, Done when 13) with random dependencies. Invariants 1 to 7 hold.
+- **Replay:** `show --at` at each position of a waiting, met, claimed, completed task matches the log. `debug rebuild` and `export` / `serve --import` keep `task_dependencies` and every state.
+
+#### 6.8.9 Proposals for Chris to review (not confirmed)
+
+**Proposal 1. A failed dependency surfaces; it does not fail the dependent.**
+
+When a dependency ends `failed` or `canceled`, the dependent stays `waiting`. The board does not fail it, because the work it waits for may still be done another way, and that is a decision for the lead or the person, not the board.
+
+- The same commit appends `DependencyFailed { dependency, state, reason }` to each waiting dependent.
+- It also posts a reply as `cork` in the dependent's thread, mentioning the handle that created the task, and the owner if that is a different handle. For example: "@lead @chris: this task waits on 01JD… (*Add the column*), which failed: tests fail on large files". So `cork wait --mentions`, a person's inbox and a lead's wait all see it, and no new notification path is needed.
+- `tasks show` and `tasks list` mark the task **stuck**: waiting with a dependency that is `failed` or `canceled`, by effective state. Stuck is a view, not a state.
+- What the lead or person can then do:
+  - **Reopen the dependency.** If it completes, the dependent readies as usual. This needs nothing new.
+  - **Cancel the dependent,** and maybe recreate it.
+  - With Proposal 2 as written, they cannot point the dependent at a replacement task. See the cost below.
+
+**Proposal 2. Dependencies are set only at creation, at first.**
+
+This removes cycle checks entirely (6.8.8), keeps the dependency graph immutable, and keeps folding simple. `DependenciesChanged` stays reserved.
+
+The cost is escalation (16.7). `tasks escalate` cancels the old task and creates a retry with a new id. Tasks waiting on the old task then get `DependencyFailed` and are stuck. With creation-only dependencies the lead must cancel and recreate each of them with `--after <retry>`. The lead skill can do that, but it churns ids and threads.
+
+What adding or changing dependencies later would require:
+- `DependenciesChanged { depends_on, open_dependencies }` on the dependent, by the owner only, and only while the task is `waiting` or `ready` (unclaimed, not finished). Changing the dependencies of a `ready` task can move it back to `waiting`, which is allowed only by this owner command, never by the board.
+- A cycle check inside the write transaction: walk from each new dependency through `task_dependencies` and refuse with `invalid_input` if the walk reaches the task. With 64 dependencies per task, a depth cap (say 1,000) keeps it bounded, and the walk reads only the index.
+- Invariant 6 becomes "the graph has no cycle at any commit boundary", checked by the stress run with a full graph walk.
+- The narrow version that fixes escalation: `tasks escalate` (or `create --replaces <old>`) moves the old task's waiting dependents onto the retry in the same commit. The retry is brand new, so the only cycle to rule out is the retry itself depending, directly or not, on one of those dependents.
+
+**Proposal 3. The results of dependencies are passed to the dependent.**
+
+- The claim response gains `dependencies: [{ task_id, text, result, completed_at, holder }]`, with the result of each dependency's latest `TaskCompleted`. `text` is the first 2 KB of its root message.
+- `tasks run` writes them to a JSON file and sets `CORK_DEPENDENCIES` to its path, beside `CORK_PREVIOUS` (9). Up to 64 results of 64 KB each is at most 4 MB, so a file, not an environment variable.
+- **Trust:** results are written by other agents, so they are notes, not instructions, as `CORK_PREVIOUS` is (9.1). The worker skill says so.
+- The lead can still pass along a summary in the dependent's text when it creates the plan. Proposal 3 only makes the actual result available at claim time, when it exists.
+
+#### 6.8.10 How the lead uses it
+
+This replaces "order the children with labels" in 17.1. The lead skill (17.2) changes in three places:
+
+1. **Plan.** The lead writes the children as one plan file with `after` keys (6.8.7), under the feature's idempotency key, so a restarted lead never duplicates the plan. Independent children have no `after`, so cheap pools start on them at once.
+2. **Watch.** The lead adds `--type DependencyFailed` to its wait on the feature's children. It does not need to watch `DependenciesMet`: workers pick those tasks up as ready.
+3. **When a dependency fails,** the lead decides, in this order: reopen the dependency with a note on what to fix, or escalate it (16.7) and then cancel and recreate its dependents with `--after <retry>` (until Proposal 2's narrow edit exists), or block the feature and ask the person.
+
+`tasks escalate` should warn when the task it replaces has waiting dependents, and list them, so the lead never leaves them stuck by accident.
+
+**For observability (18, not changed here):** time spent `waiting` is not queue time. Queue time for a dependent starts at its `DependenciesMet`.
 
 ## 7. HTTP API
 
@@ -577,7 +743,7 @@ Scope:
 Out of scope for Milestone 1:
 
 - Multiple boards, grants, private channels.
-- Dependencies (`needs`), `waiting`, and plans from JSON.
+- Dependencies (`depends_on`, `--after`), `waiting`, and plans from JSON (6.8).
 - Editing, deleting and redacting messages (event types reserved).
 - Sync with Slack, GitHub or Linear.
 - An SDK, an MCP server, or a UI, including the UI's sign-in (14.4).
@@ -915,7 +1081,7 @@ Two more rules:
   cork tasks create work "Redesign the storage layer" --needs rust,architecture,tier-3
   ```
 
-  `--needs a,b` is CLI shorthand for `--label needs.a=yes --label needs.b=yes`. A task with no `needs.*` labels can go to any pool. (The `needs.` prefix is a label. It is unrelated to the `needs` field for dependencies in 6.8. If that collision proves confusing, the prefix can become `wants.` before Milestone 2 ships.)
+  `--needs a,b` is CLI shorthand for `--label needs.a=yes --label needs.b=yes`. A task with no `needs.*` labels can go to any pool. (The `needs.` prefix is a label and means keywords only. Dependencies use `depends_on` and `--after` (6.8.2), so the two never collide.)
 - **Tiers are keywords too.** A tier 3 model also covers `tier-1`, `tier-2` and `tier-3`. So "needs at least a tier 2 model" is `--needs tier-2`, with no new rule.
 - **Covers** means every `needs.*` label on the task names a keyword in the pool's list, after aliases. The dispatcher checks this (16.4). The daemon only stores and filters labels, as in Milestone 1.
 - **A stronger pool can take easier work.** An opus worker covers a `docs` task, which keeps throughput up when the cheap pool is busy. The dispatcher still prefers the cheapest pool that covers a task. A pool that should take only work that needs it sets `exclusive = true`, which also requires its top tier: such a pool takes only tasks that ask for `tier-3`.
@@ -1008,7 +1174,7 @@ For the experiment, a feature and its tasks are linked with **plain labels**, so
 - **Children** are tasks in a work channel labelled `parent=<feature id>`.
 - **Rollup:** `cork tasks list --label parent=<id>` lists them with their states. The lead skill sums them ("5 completed, 1 claimed, 1 blocked") and posts the summary in the feature's thread.
 - **Watching all of them:** `cork wait --label parent=<id> --type TaskCompleted --type TaskFailed --type TaskBlocked --type LeaseExpired` wakes on any child's change. The only addition is `--type` on `wait`, a CLI flag for a filter the API already has (7.4).
-- **Order:** inside a feature, `needs` dependencies (6.8) order the children, such as "tests after the schema change".
+- **Order:** inside a feature, dependencies (6.8) order the children, such as "tests after the schema change". Once 6.8 is built, the lead creates them as one plan with `after` keys (6.8.10).
 - **Closing:** the lead decides when the feature is done and completes it. Children ending never closes the feature by itself. To cancel a feature, the lead cancels its unclaimed children first, then the feature.
 
 **What would move this into the core later:** checks the board can't make on labels (a child of a missing parent, a feature claimed by a worker), a rollup in one read, and cancel of a whole feature in one commit. The experiment (17.5) tells us whether those matter.
