@@ -325,9 +325,13 @@ dependencies = [
 name = "cork-fleet"
 version = "0.1.0"
 dependencies = [
+ "cork-api",
+ "cork-client",
  "cork-core",
+ "libc",
  "serde",
  "serde_json",
+ "tokio",
  "toml",
 ]
 

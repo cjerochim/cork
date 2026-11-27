@@ -39,6 +39,8 @@ impl Env {
             .env_remove("CORK_TASK")
             .env_remove("CORK_URL")
             .env_remove("CORK_TOKEN")
+            .env_remove("CORK_MODELS")
+            .env_remove("CORK_WORKERS")
             .stdin(Stdio::null());
         c
     }

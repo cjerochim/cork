@@ -223,6 +223,17 @@ async fn run_one(
     if let Some(p) = &previous {
         cmd.env("CORK_PREVIOUS", p);
     }
+    // If this wrapper is killed (kill -9, or its fleet's supervisor dies),
+    // the command stops too instead of working on a task nobody holds.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

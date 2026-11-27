@@ -83,3 +83,66 @@ Among the pools that cover a task, the cheapest wins: by `cost` (a model without
 ```bash
 cork wait work/ --label parent=$F --type TaskCompleted --type TaskFailed --type TaskBlocked --type LeaseExpired
 ```
+
+## Running a fleet
+
+`workers.toml` says which pools run on this machine. It lives at `~/.config/cork/workers.toml`, or comes from `--config FILE` or `CORK_WORKERS`. A `.json` file in the same shape works too.
+
+```toml
+[fleet]
+name = "dev"               # in profile names and the control socket
+models = "models.toml"     # relative to this file
+max_workers = 12           # cap across all pools (default 16)
+
+[pool.fast]
+model = "haiku"
+select = "work/"           # channel selector
+count = 5                  # initial size
+min = 0                    # bounds for scale and autoscale (max defaults to max_workers)
+max = 10
+lease = "10m"
+max_runtime = "2h"
+# command = [...]          # override the model's; {model} and {pool} are filled in
+# keywords = ["docs"]      # narrow what this pool takes
+# env = { KEY = "v" }      # added to the command's environment
+# cwd = "../repo"          # relative to this file
+# from = "*"               # whose tasks: default the fleet's person, "*" for anyone
+# exclusive = true         # only tasks that ask for this model's top tier
+
+[pool.fast.autoscale]      # optional
+target_ready_per_worker = 2
+idle_after = "5m"
+```
+
+```bash
+cork workers up [--config FILE] [--detach]   # foreground by default; --detach logs to ~/.config/cork/workers/<fleet>.log
+cork workers status [--json]                 # pools, workers and their tasks, restarts, pauses, unmatched tasks
+cork workers scale fast +3                   # or -2, or 4; within min and max and max_workers
+cork workers drain fast                      # finish current tasks, then stop the pool's workers
+cork workers reload                          # re-read both files
+cork workers down [--now]                    # drain and stop; --now releases every task and stops
+```
+
+The control commands find the fleet by `--fleet NAME`, else by the config's name, else by the only fleet running. They talk to `~/.config/cork/workers/<fleet>.sock` (mode `0600`), not to the board.
+
+### How dispatch works
+
+- The supervisor follows `/events` for its pools' channels, and also looks every 2 s.
+- Each round lists ready tasks oldest first. Each task goes to a free worker of the cheapest pool that covers it (see "Who can take a task").
+- A worker is one child: `cork --as <fleet>-<pool>-<n> tasks run <id> -- <command>`. The command gets `CORK_MODEL`, `CORK_POOL`, `CORK_TIER` and `CORK_FLEET`, on top of what `tasks run` sets.
+- `tasks history` shows which pool, and so which model, did each attempt.
+
+The supervisor handles each child's exit by its code:
+
+| Exit | What the supervisor does |
+| --- | --- |
+| 0, 8, 9, 10, 5 | The worker is free again. |
+| 7, or 1 for a race (`invalid_state` and the like) | Someone else got the task first. The worker tries the next one. |
+| 11 | The daemon was lost. Dispatch pauses with backoff, from 1 s doubling to 30 s. |
+| A signal, another error, or exit 8 less than 2 s after the start | A crash. The worker is replaced after a backoff from 0.5 s doubling to 30 s, and the task is left alone for 5 s. |
+
+- **Crash loop:** 5 crashes in 60 s pause the pool. `status` shows the last error, and one message goes to `cork/fleet`. `scale` or `reload` resumes the pool.
+- **Scaling down:** idle workers stop at once. Busy workers are drained: they get no new task, so they finish and settle their current one, and nothing is released or failed.
+- **Reload:** a change of a pool's model, command, env, cwd, lease or max runtime drains the old workers and starts new ones. Tasks in progress finish on the model that started them. A config with an error is refused, and the running config stays.
+- **No orphans (Linux):** children get `SIGTERM` when the supervisor dies, so each wrapper releases its task and exits. The command under `tasks run` also gets `SIGTERM` if its wrapper dies. A first `SIGTERM` or Ctrl-C drains; a second stops every child now.
+- **Two fleets, one board:** fleets on one or many machines can share a board. The single writer gives each task one winner; the loser exits 7 and moves on.
