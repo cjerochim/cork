@@ -184,10 +184,37 @@ async fn check_projection(c: &mut Check, d: &Daemon, id: &str, evs: &[&Value]) {
     };
     match d.board.store().get_task(id).await {
         Ok(Some(st)) if st.task == folded => {}
+        // The board kept writing (a lease ended) after the log was read.
+        // Fold the stream again, read after the projection, and compare.
+        Ok(Some(st)) if st.task.version > folded.version => match refold(d, id).await {
+            Some(again) if again == st.task => {}
+            _ => c.bad(format!(
+                "task {id}: projection differs from a fresh fold (state {:?}, version {}, after a re-read)",
+                st.task.state, st.task.version
+            )),
+        },
         Ok(Some(st)) => c.bad(format!(
             "task {id}: projection differs from a fresh fold (state {:?} vs {:?}, version {} vs {})",
             st.task.state, folded.state, st.task.version, folded.version
         )),
         other => c.bad(format!("task {id}: no projection: {other:?}")),
     }
+}
+
+/// The task folded from its stream as it is now.
+async fn refold(d: &Daemon, id: &str) -> Option<Task> {
+    let f = cork_store::EventFilter {
+        stream_id: Some(format!("task:{id}")),
+        limit: 10_000,
+        ..Default::default()
+    };
+    let page = d.board.store().read_events(&f).await.ok()?;
+    let mut evs = vec![];
+    for e in &page.events {
+        evs.push((
+            serde_json::from_value::<TaskEvent>(e.data.clone()).ok()?,
+            e.at,
+        ));
+    }
+    Task::from_events(evs.iter().map(|(e, at)| (e, *at))).ok()
 }

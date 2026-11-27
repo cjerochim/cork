@@ -876,8 +876,16 @@ fn apply_commit(tx: &Connection, commit: &Commit) -> Result<Vec<StoredEvent>> {
     let head_now = position;
     for p in &commit.projections {
         match p {
-            Projection::Message(m) => project_message(tx, m, &last_pos, head_now)?,
-            Projection::Task(t) => project_task(tx, t, &first_pos, head_now)?,
+            Projection::Message(m) => {
+                let stream = thread_stream(&m.thread_id);
+                let pos = last_pos.get(stream.as_str()).copied().unwrap_or(head_now);
+                project_message(tx, m, pos)?
+            }
+            Projection::Task(t) => {
+                let stream = task_stream(&t.id);
+                let created = first_pos.get(stream.as_str()).copied().unwrap_or(head_now);
+                project_task(tx, t, created)?
+            }
             Projection::SetMessageLabel {
                 message_id,
                 key,
@@ -904,14 +912,122 @@ fn apply_commit(tx: &Connection, commit: &Commit) -> Result<Vec<StoredEvent>> {
     Ok(out)
 }
 
-fn project_message(
-    tx: &Connection,
-    m: &Message,
-    last_pos: &HashMap<&str, u64>,
-    head_now: u64,
-) -> Result<()> {
-    let stream = thread_stream(&m.thread_id);
-    let pos = last_pos.get(stream.as_str()).copied().unwrap_or(head_now);
+/// Store one event as given, position included (import).
+fn insert_event(tx: &Connection, e: &StoredEvent) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO events (position, stream_id, version, type, schema, data, actor, at, channel, thread_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )
+    .sql()?
+    .execute(params![
+        e.position as i64,
+        e.stream_id,
+        e.version as i64,
+        e.event_type,
+        e.schema as i64,
+        to_json(&e.data)?,
+        e.actor,
+        e.at,
+        e.meta.channel,
+        e.meta.thread_id
+    ])
+    .sql()?;
+    let task_event = e.stream_id.starts_with("task:");
+    let mut st = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO event_labels (key, value, position) VALUES (?1, ?2, ?3)",
+        )
+        .sql()?;
+    for (k, v) in &e.meta.labels {
+        // Task events store only board labels; their task's labels are joined on read.
+        if task_event && !cork_core::labels::is_reserved(k) {
+            continue;
+        }
+        st.execute(params![k, v, e.position as i64]).sql()?;
+    }
+    Ok(())
+}
+
+/// Write every projection row the log implies.
+fn write_derived(tx: &Connection, events: &[StoredEvent]) -> Result<()> {
+    let d = cork_store::replay::derive(events)?;
+    for (m, pos) in &d.messages {
+        project_message(tx, m, *pos)?;
+    }
+    for (t, created) in &d.tasks {
+        project_task(tx, t, *created)?;
+    }
+    Ok(())
+}
+
+const PROJECTION_TABLES: [&str; 5] = [
+    "messages",
+    "message_labels",
+    "channels",
+    "tasks",
+    "task_labels",
+];
+
+impl SqliteStore {
+    /// Drop every projection row and build them again from the log
+    /// (`cork debug rebuild`, on a copy of the database).
+    pub async fn rebuild_projections(&self) -> Result<()> {
+        self.on_writer(|w| {
+            let tx = w
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .sql()?;
+            for t in PROJECTION_TABLES {
+                tx.execute(&format!("DELETE FROM {t}"), []).sql()?;
+            }
+            let mut events = vec![];
+            let mut after = 0;
+            loop {
+                let page = read_events(&tx, &EventFilter::after(after, MAX_LIMIT as usize))?;
+                let n = page.events.len();
+                if let Some(e) = page.events.last() {
+                    after = e.position;
+                }
+                events.extend(page.events);
+                if n < MAX_LIMIT as usize {
+                    break;
+                }
+            }
+            write_derived(&tx, &events)?;
+            tx.commit().sql()
+        })
+        .await
+    }
+
+    /// Every projection row as a sorted line of text, for diffing.
+    pub async fn projection_dump(&self) -> Result<Vec<String>> {
+        self.read(|c| {
+            let mut out = vec![];
+            for t in PROJECTION_TABLES {
+                let mut st = c.prepare(&format!("SELECT * FROM {t}")).sql()?;
+                let cols = st.column_count();
+                let rows = st
+                    .query_map([], |r| {
+                        let mut parts = vec![t.to_string()];
+                        for i in 0..cols {
+                            let v: Value = r.get(i)?;
+                            parts.push(format!("{v:?}"));
+                        }
+                        Ok(parts.join(" | "))
+                    })
+                    .sql()?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .sql()?;
+                out.extend(rows);
+            }
+            out.sort();
+            Ok(out)
+        })
+        .await
+    }
+}
+
+fn project_message(tx: &Connection, m: &Message, pos: u64) -> Result<()> {
     tx.prepare_cached(
         "INSERT INTO messages (id, position, thread_id, channel, is_root, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
@@ -949,12 +1065,8 @@ fn project_message(
     Ok(())
 }
 
-fn project_task(
-    tx: &Connection,
-    t: &Task,
-    first_pos: &HashMap<&str, u64>,
-    head_now: u64,
-) -> Result<()> {
+/// Insert or update a task row. `created` is its queue place, used on insert.
+fn project_task(tx: &Connection, t: &Task, created: u64) -> Result<()> {
     let exists: bool = tx
         .prepare_cached("SELECT EXISTS (SELECT 1 FROM tasks WHERE id = ?1)")
         .sql()?
@@ -984,8 +1096,6 @@ fn project_task(
         .sql()?;
         return Ok(());
     }
-    let stream = task_stream(&t.id);
-    let created = first_pos.get(stream.as_str()).copied().unwrap_or(head_now);
     tx.prepare_cached(
         "INSERT INTO tasks (id, created_position, channel, owner, assignee, state, expires_at, \
            attempts, max_attempts, version, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -1161,5 +1271,39 @@ impl Store for SqliteStore {
 
     async fn checkpoint(&self) -> Result<()> {
         self.on_writer(|w| w.checkpoint()).await
+    }
+
+    async fn import(&self, events: Vec<StoredEvent>) -> Result<()> {
+        self.on_writer(move |w| {
+            let tx = w
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .sql()?;
+            if head(&tx)? != 0 {
+                return Err(BoardError::new(
+                    ErrorCode::InvalidState,
+                    "import needs an empty store",
+                ));
+            }
+            for (i, e) in events.iter().enumerate() {
+                if e.position != i as u64 + 1 {
+                    return Err(BoardError::invalid(format!(
+                        "import: position {} at line {}: positions must start at 1 with no gaps",
+                        e.position,
+                        i + 1
+                    )));
+                }
+                if e.version != stream_version(&tx, &e.stream_id)? + 1 {
+                    return Err(BoardError::invalid(format!(
+                        "import: {} version {} is out of order",
+                        e.stream_id, e.version
+                    )));
+                }
+                insert_event(&tx, e)?;
+            }
+            write_derived(&tx, &events)?;
+            tx.commit().sql()
+        })
+        .await
     }
 }

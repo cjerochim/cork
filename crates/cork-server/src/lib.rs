@@ -11,6 +11,11 @@ pub mod clock;
 pub mod http;
 
 pub use auth::{Authenticator, LocalToken};
+
+/// HTTP types an [`Authenticator`] sees, re-exported so callers need no axum.
+pub mod http_types {
+    pub use axum::http::HeaderMap;
+}
 pub use board::{Board, BoardConfig, Caller};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use http::{App, HostPolicy, router};

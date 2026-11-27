@@ -1,0 +1,18 @@
+[package]
+name = "cork-client"
+description = "Client for the Cork HTTP API: discovery, daemon auto-start and claim files."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cork-api = { path = "../cork-api", version = "0.1.0" }
+cork-core = { path = "../cork-core", version = "0.1.0" }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time", "fs", "process"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

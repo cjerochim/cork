@@ -279,6 +279,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "cork-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "cork-api",
+ "cork-client",
+ "cork-core",
+ "cork-server",
+ "cork-store",
+ "cork-store-sqlite",
+ "hex",
+ "libc",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cork-client"
+version = "0.1.0"
+dependencies = [
+ "cork-api",
+ "cork-core",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "cork-core"
 version = "0.1.0"
 dependencies = [

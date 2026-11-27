@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use cork_core::{ChannelSelector, Message, Millis, Result, Task, TaskState};
 use serde::{Deserialize, Serialize};
 
+pub mod replay;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
@@ -327,4 +328,9 @@ pub trait Store: Send + Sync + 'static {
     async fn prune_idempotency(&self, before: Millis) -> Result<u64>;
     /// Flush and shrink any write-ahead log. Called when idle.
     async fn checkpoint(&self) -> Result<()>;
+
+    /// Load an exported log into an **empty** store, keeping every position,
+    /// and build the projections from it (HANDOFF 13.4). The only write that
+    /// core does not decide; the daemon runs it at start-up only.
+    async fn import(&self, events: Vec<StoredEvent>) -> Result<()>;
 }
