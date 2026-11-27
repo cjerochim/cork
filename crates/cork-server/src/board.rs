@@ -33,6 +33,13 @@ const EXPIRE_BATCH: usize = 256;
 /// Default and largest page for event reads.
 const EVENTS_PAGE: usize = 100;
 const EVENTS_PAGE_MAX: usize = 1_000;
+/// Recent committed events kept in memory, so a waiter that starts a little
+/// behind the head catches up without reading the store.
+const RECENT_CAPACITY: usize = 8_192;
+/// With no write for this long, the daemon checkpoints the WAL.
+const IDLE_CHECKPOINT: Duration = Duration::from_secs(10);
+/// Idempotency rows are kept this long (7.5).
+const IDEMPOTENCY_KEEP_MS: Millis = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 pub struct BoardConfig {
@@ -403,6 +410,11 @@ pub struct Board<S: Store> {
     degraded: AtomicBool,
     streams: AtomicUsize,
     stopped: AtomicBool,
+    /// The last committed position, and the events just before it.
+    head: AtomicU64,
+    recent: Mutex<VecDeque<Arc<StoredEvent>>>,
+    last_write: Mutex<std::time::Instant>,
+    store_reads: AtomicU64,
 }
 
 impl<S: Store> Board<S> {
@@ -425,9 +437,17 @@ impl<S: Store> Board<S> {
             degraded: AtomicBool::new(false),
             streams: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
+            head: AtomicU64::new(0),
+            recent: Mutex::new(VecDeque::new()),
+            last_write: Mutex::new(std::time::Instant::now()),
+            store_reads: AtomicU64::new(0),
         });
+        board
+            .head
+            .store(board.store.head().await?, Ordering::SeqCst);
         board.restart_grace().await?;
         tokio::spawn(board.clone().lease_timer());
+        tokio::spawn(board.clone().maintenance());
         Ok(board)
     }
 
@@ -476,8 +496,24 @@ impl<S: Store> Board<S> {
             Ok((events, (value, handoffs))) => {
                 self.degraded.store(false, Ordering::Relaxed);
                 let touches_tasks = events.iter().any(|e| e.stream_id.starts_with("task:"));
-                for e in events {
-                    let _ = self.events.send(Arc::new(e));
+                if !events.is_empty() {
+                    *self.last_write.lock().unwrap() = std::time::Instant::now();
+                    let events: Vec<Arc<StoredEvent>> = events.into_iter().map(Arc::new).collect();
+                    {
+                        let mut recent = self.recent.lock().unwrap();
+                        recent.extend(events.iter().cloned());
+                        while recent.len() > RECENT_CAPACITY {
+                            recent.pop_front();
+                        }
+                    }
+                    // Set before sending: a reader that subscribes and then
+                    // reads `head` never misses an event at or below it.
+                    if let Some(last) = events.last() {
+                        self.head.store(last.position, Ordering::SeqCst);
+                    }
+                    for e in events {
+                        let _ = self.events.send(e);
+                    }
                 }
                 drop(_order);
                 if touches_tasks {
@@ -1052,24 +1088,21 @@ impl<S: Store> Board<S> {
     ) -> Result<EventsPage> {
         let mut rx = self.events.subscribe();
         let limit = page(f.limit, EVENTS_PAGE, EVENTS_PAGE_MAX);
-        let mut cursor = match after {
-            Some(a) => a,
-            None => self.store.head().await?,
-        };
+        let mut cursor = after.unwrap_or_else(|| self.last_position());
         let wait = Duration::from_millis(wait_ms.min(self.cfg.max_wait_ms));
         let deadline = tokio::time::Instant::now() + wait;
         'catch_up: loop {
             f.after = cursor;
             f.limit = limit;
-            let page = self.store.read_events(&f).await?;
-            if let Some(last) = page.events.last() {
+            let (events, head) = self.catch_up(&f).await?;
+            if let Some(last) = events.last() {
                 return Ok(EventsPage {
                     next_after: last.position,
-                    events: page.events.iter().map(event_out).collect(),
+                    events: events.iter().map(|e| event_out(e)).collect(),
                     now: self.now(),
                 });
             }
-            cursor = cursor.max(page.head);
+            cursor = cursor.max(head);
             loop {
                 let e = match tokio::time::timeout_at(deadline, rx.recv()).await {
                     Err(_) | Ok(Err(broadcast::error::RecvError::Closed)) => {
@@ -1109,6 +1142,72 @@ impl<S: Store> Board<S> {
                         now: self.now(),
                     });
                 }
+            }
+        }
+    }
+
+    /// The last committed position, from memory.
+    pub fn last_position(&self) -> u64 {
+        self.head.load(Ordering::SeqCst)
+    }
+
+    /// How many times waits and streams have read the store to catch up.
+    pub fn store_reads(&self) -> u64 {
+        self.store_reads.load(Ordering::Relaxed)
+    }
+
+    /// Matching events after `f.after` (up to `f.limit`) and the position
+    /// checked up to. Served from the in-memory window of recent events when
+    /// it covers the range; otherwise one store read.
+    pub async fn catch_up(&self, f: &EventFilter) -> Result<(Vec<Arc<StoredEvent>>, u64)> {
+        let head = self.last_position();
+        if f.after >= head {
+            return Ok((vec![], head));
+        }
+        {
+            let recent = self.recent.lock().unwrap();
+            if recent.front().is_some_and(|e| e.position <= f.after + 1) {
+                let mut out = vec![];
+                let mut checked = f.after;
+                for e in recent.iter().filter(|e| e.position > f.after) {
+                    checked = e.position;
+                    if f.matches(e) {
+                        out.push(e.clone());
+                        if out.len() >= f.limit.max(1) {
+                            break;
+                        }
+                    }
+                }
+                return Ok((out, checked));
+            }
+        }
+        self.store_reads.fetch_add(1, Ordering::Relaxed);
+        let page = self.store.read_events(f).await?;
+        Ok((page.events.into_iter().map(Arc::new).collect(), page.head))
+    }
+
+    /// Checkpoint the WAL when idle, and prune old idempotency rows.
+    async fn maintenance(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut checkpointed = false;
+        let mut last_prune = std::time::Instant::now() - Duration::from_secs(3600);
+        loop {
+            tick.tick().await;
+            if self.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            let idle = self.last_write.lock().unwrap().elapsed() >= IDLE_CHECKPOINT;
+            if idle && !checkpointed {
+                checkpointed = self.store.checkpoint().await.is_ok();
+            } else if !idle {
+                checkpointed = false;
+            }
+            if last_prune.elapsed() >= Duration::from_secs(3600) {
+                last_prune = std::time::Instant::now();
+                let _ = self
+                    .store
+                    .prune_idempotency(self.now() - IDEMPOTENCY_KEEP_MS)
+                    .await;
             }
         }
     }

@@ -426,30 +426,27 @@ async fn stream<S: Store>(
     let slot = app.board.open_stream()?;
     let board = slot.board().clone();
     let mut rx = board.subscribe();
-    let mut cursor = match resume.or(q.after) {
-        Some(a) => a,
-        None => board.head().await?,
-    };
+    let mut cursor = resume.or(q.after).unwrap_or_else(|| board.last_position());
     let s = async_stream::stream! {
         let _slot = slot;
         'catch_up: loop {
-            // Read from the store until caught up with the head.
+            // Catch up (from memory when it can, else the store) to the head.
             loop {
                 f.after = cursor;
                 f.limit = 500;
-                let page = match board.store().read_events(&f).await {
+                let (events, head) = match board.catch_up(&f).await {
                     Ok(p) => p,
                     Err(_) => {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
                     }
                 };
-                for e in &page.events {
+                for e in &events {
                     cursor = e.position;
                     yield Ok::<Event, Infallible>(sse_event(&event_out(e)));
                 }
-                if page.events.len() < 500 {
-                    cursor = cursor.max(page.head);
+                if events.len() < 500 {
+                    cursor = cursor.max(head);
                     break;
                 }
             }
