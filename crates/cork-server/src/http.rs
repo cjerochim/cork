@@ -123,8 +123,14 @@ pub fn router<S: Store>(app: AppState<S>) -> Router {
         .route("/export", get(export::<S>))
         .layer(middleware::from_fn_with_state(app.clone(), guard::<S>))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY));
+    // `/metrics` sits at the root, where Prometheus looks, behind the same
+    // Host check and token as the API (18.4).
+    let metrics = Router::new()
+        .route("/metrics", get(metrics::<S>))
+        .layer(middleware::from_fn_with_state(app.clone(), guard::<S>));
     Router::new()
         .nest(PREFIX, v1)
+        .merge(metrics)
         .fallback(|| async { err(ErrorCode::NotFound, "no such route") })
         .with_state(app)
 }
@@ -229,6 +235,15 @@ fn write_req(
 }
 
 // ---------- service ----------
+
+async fn metrics<S: Store>(State(app): State<AppState<S>>) -> Response {
+    let mut r = app.board.metrics_text().into_response();
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    r
+}
 
 async fn health() -> Json<Health> {
     Json(Health {

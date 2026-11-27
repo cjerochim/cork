@@ -186,6 +186,33 @@ struct State {
     /// Pools whose pause was already posted to `cork/fleet`.
     announced: BTreeSet<String>,
     started: Instant,
+    /// Usage the wrappers reported, by (pool, model).
+    usage: BTreeMap<(String, String), UsageTotals>,
+    /// Times each pool was paused for a crash loop.
+    crash_loops: BTreeMap<String, u64>,
+}
+
+/// Usage totals from the records wrappers leave in `$CORK_USAGE_REPORT`.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct UsageTotals {
+    attempts: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+    /// Attempts whose record had no cost.
+    cost_unknown: u64,
+}
+
+impl UsageTotals {
+    fn add(&mut self, r: &Value) {
+        self.attempts += 1;
+        self.input_tokens += r["input_tokens"].as_u64().unwrap_or(0);
+        self.output_tokens += r["output_tokens"].as_u64().unwrap_or(0);
+        match r["cost_usd"].as_f64() {
+            Some(c) => self.cost_usd += c,
+            None => self.cost_unknown += 1,
+        }
+    }
 }
 
 struct Shared {
@@ -194,6 +221,7 @@ struct Shared {
     client: Mutex<Client>,
     conn: Connect,
     cork_exe: PathBuf,
+    home: PathBuf,
     done: Notify,
 }
 
@@ -205,6 +233,11 @@ pub async fn run(o: Options) -> Result<i32, String> {
     let me = client.whoami().await.map_err(|e| e.to_string())?;
     let sock = socket_path(&o.home, &o.fleet.name);
     let listener = bind(&sock).await?;
+    let usage_dir = o
+        .home
+        .join("workers")
+        .join(format!("{}-usage", o.fleet.name));
+    std::fs::create_dir_all(&usage_dir).map_err(|e| format!("{}: {e}", usage_dir.display()))?;
 
     let mut pools = BTreeMap::new();
     for (name, p) in &o.fleet.pools {
@@ -225,11 +258,14 @@ pub async fn run(o: Options) -> Result<i32, String> {
             daemon_backoff: DAEMON_FIRST_BACKOFF,
             announced: BTreeSet::new(),
             started: Instant::now(),
+            usage: BTreeMap::new(),
+            crash_loops: BTreeMap::new(),
         }),
         kick: Notify::new(),
         client: Mutex::new(client),
         conn: o.conn,
         cork_exe: o.cork_exe,
+        home: o.home.clone(),
         done: Notify::new(),
     });
     {
@@ -245,6 +281,17 @@ pub async fn run(o: Options) -> Result<i32, String> {
 
     tokio::spawn(follow(shared.clone(), me.head));
     tokio::spawn(control(shared.clone(), listener));
+    let port = shared.state.lock().await.fleet.metrics_port;
+    if let Some(port) = port {
+        let l = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .map_err(|e| format!("metrics on 127.0.0.1:{port}: {e}"))?;
+        eprintln!(
+            "cork workers: metrics on http://{}/metrics",
+            l.local_addr().map_err(|e| e.to_string())?
+        );
+        tokio::spawn(serve_metrics(shared.clone(), l));
+    }
     tokio::spawn(signals(shared.clone()));
 
     loop {
@@ -547,6 +594,8 @@ fn start(shared: &Arc<Shared>, st: &mut State, fleet: &str, pool_name: &str, tas
     };
     let spec = p.spec.clone();
     let w = &mut p.workers[i];
+    let report = usage_report_path(&shared.home, fleet, &w.profile);
+    let _ = std::fs::remove_file(&report);
     let mut cmd = tokio::process::Command::new(&shared.cork_exe);
     cmd.arg("--as")
         .arg(&w.profile)
@@ -563,6 +612,7 @@ fn start(shared: &Arc<Shared>, st: &mut State, fleet: &str, pool_name: &str, tas
         .env("CORK_POOL", &spec.name)
         .env("CORK_TIER", spec.model.tier.to_string())
         .env("CORK_FLEET", fleet)
+        .env("CORK_USAGE_REPORT", &report)
         .env_remove("CORK_CLAIM")
         .env_remove("CORK_TASK")
         .stdin(Stdio::null())
@@ -681,6 +731,21 @@ async fn watch(
 
     let mut st = shared.state.lock().await;
     st.inflight.remove(&task_id);
+    let fleet_name = st.fleet.name.clone();
+    let report = usage_report_path(&shared.home, &fleet_name, &profile);
+    if let Some(r) = std::fs::read_to_string(&report)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    {
+        let model = r["model"].as_str().map(str::to_string).unwrap_or_else(|| {
+            st.pools
+                .get(&pool)
+                .map(|p| p.spec.model.name.clone())
+                .unwrap_or_default()
+        });
+        st.usage.entry((pool.clone(), model)).or_default().add(&r);
+    }
+    let _ = std::fs::remove_file(&report);
     let Some(p) = st.pools.get_mut(&pool) else {
         return;
     };
@@ -772,6 +837,8 @@ fn crashed(st: &mut State, pool: &str, i: usize, msg: String) {
         p.crashes.pop_front();
     }
     if p.crashes.len() >= CRASH_LIMIT && p.paused.is_none() {
+        *st.crash_loops.entry(pool.to_string()).or_default() += 1;
+        let p = st.pools.get_mut(pool).expect("pool");
         eprintln!("cork workers: pool {pool} paused after {CRASH_LIMIT} crashes in 60 s: {msg}");
         p.paused = Some(msg);
     }
@@ -820,6 +887,195 @@ async fn announce(shared: &Shared) {
     }
 }
 
+// ---------- metrics ----------
+
+/// Where a worker's wrapper leaves its usage record for the supervisor.
+fn usage_report_path(home: &std::path::Path, fleet: &str, profile: &str) -> PathBuf {
+    home.join("workers")
+        .join(format!("{fleet}-usage"))
+        .join(format!("{profile}.json"))
+}
+
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// The supervisor's `/metrics` (18.4): workers per pool, restarts, crash
+/// loops, unmatched tasks, and the usage its wrappers reported.
+fn metrics_text(st: &State) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let fleet = esc(&st.fleet.name);
+    let head = |out: &mut String, name: &str, kind: &str, help: &str| {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} {kind}");
+    };
+    head(
+        &mut out,
+        "cork_fleet_workers",
+        "gauge",
+        "Workers by pool and state.",
+    );
+    for (n, p) in &st.pools {
+        let busy = p.workers.iter().filter(|w| w.busy.is_some()).count();
+        let live: Vec<&Worker> = p.live().collect();
+        let idle = live.iter().filter(|w| w.busy.is_none()).count();
+        let draining = p.workers.iter().filter(|w| w.draining).count();
+        for (state, v) in [("busy", busy), ("idle", idle), ("draining", draining)] {
+            let _ = writeln!(
+                out,
+                "cork_fleet_workers{{fleet=\"{fleet}\",pool=\"{}\",model=\"{}\",state=\"{state}\"}} {v}",
+                esc(n),
+                esc(&p.spec.model.name)
+            );
+        }
+    }
+    head(
+        &mut out,
+        "cork_fleet_pool_target",
+        "gauge",
+        "Workers each pool aims for.",
+    );
+    for (n, p) in &st.pools {
+        let _ = writeln!(
+            out,
+            "cork_fleet_pool_target{{fleet=\"{fleet}\",pool=\"{}\"}} {}",
+            esc(n),
+            p.target
+        );
+    }
+    head(
+        &mut out,
+        "cork_fleet_pool_paused",
+        "gauge",
+        "1 while a pool is paused after a crash loop.",
+    );
+    for (n, p) in &st.pools {
+        let _ = writeln!(
+            out,
+            "cork_fleet_pool_paused{{fleet=\"{fleet}\",pool=\"{}\"}} {}",
+            esc(n),
+            p.paused.is_some() as u8
+        );
+    }
+    head(
+        &mut out,
+        "cork_fleet_restarts_total",
+        "counter",
+        "Worker crashes, each followed by a restart.",
+    );
+    for (n, p) in &st.pools {
+        let _ = writeln!(
+            out,
+            "cork_fleet_restarts_total{{fleet=\"{fleet}\",pool=\"{}\"}} {}",
+            esc(n),
+            p.restarts
+        );
+    }
+    head(
+        &mut out,
+        "cork_fleet_crash_loops_total",
+        "counter",
+        "Times a pool was paused for a crash loop.",
+    );
+    for n in st.pools.keys() {
+        let _ = writeln!(
+            out,
+            "cork_fleet_crash_loops_total{{fleet=\"{fleet}\",pool=\"{}\"}} {}",
+            esc(n),
+            st.crash_loops.get(n).copied().unwrap_or(0)
+        );
+    }
+    head(
+        &mut out,
+        "cork_fleet_unmatched_tasks",
+        "gauge",
+        "Ready tasks with needs no pool covers.",
+    );
+    let _ = writeln!(
+        out,
+        "cork_fleet_unmatched_tasks{{fleet=\"{fleet}\"}} {}",
+        st.unmatched.len()
+    );
+    for (name, help) in [
+        (
+            "cork_fleet_usage_attempts_total",
+            "Attempts whose wrapper reported usage.",
+        ),
+        (
+            "cork_fleet_input_tokens_total",
+            "Input tokens the wrappers reported.",
+        ),
+        (
+            "cork_fleet_output_tokens_total",
+            "Output tokens the wrappers reported.",
+        ),
+        (
+            "cork_fleet_cost_usd_total",
+            "Cost the agents reported, in dollars. An estimate.",
+        ),
+        (
+            "cork_fleet_cost_unknown_total",
+            "Attempts whose usage had no cost.",
+        ),
+    ] {
+        head(&mut out, name, "counter", help);
+        for ((pool, model), u) in &st.usage {
+            let v = match name {
+                "cork_fleet_usage_attempts_total" => u.attempts as f64,
+                "cork_fleet_input_tokens_total" => u.input_tokens as f64,
+                "cork_fleet_output_tokens_total" => u.output_tokens as f64,
+                "cork_fleet_cost_usd_total" => u.cost_usd,
+                _ => u.cost_unknown as f64,
+            };
+            let _ = writeln!(
+                out,
+                "{name}{{fleet=\"{fleet}\",pool=\"{}\",model=\"{}\"}} {v}",
+                esc(pool),
+                esc(model)
+            );
+        }
+    }
+    out
+}
+
+/// A tiny HTTP server for `GET /metrics` on loopback.
+async fn serve_metrics(shared: Arc<Shared>, l: tokio::net::TcpListener) {
+    loop {
+        let Ok((mut s, _)) = l.accept().await else {
+            continue;
+        };
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 16 * 1024 {
+                match tokio::time::timeout(Duration::from_secs(5), s.read(&mut chunk)).await {
+                    Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                    _ => return,
+                }
+            }
+            let line = String::from_utf8_lossy(&buf);
+            let path = line.split_whitespace().nth(1).unwrap_or("");
+            let (status, body) = if line.starts_with("GET ") && path == "/metrics" {
+                let st = shared.state.lock().await;
+                ("200 OK", metrics_text(&st))
+            } else {
+                ("404 Not Found", "not found\n".to_string())
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(resp.as_bytes()).await;
+            let _ = s.shutdown().await;
+        });
+    }
+}
+
 // ---------- control ----------
 
 async fn control(shared: Arc<Shared>, listener: tokio::net::UnixListener) {
@@ -854,6 +1110,10 @@ async fn handle(shared: &Arc<Shared>, req: &Value) -> Value {
         "status" => {
             let st = shared.state.lock().await;
             status(&st)
+        }
+        "metrics" => {
+            let st = shared.state.lock().await;
+            json!({"ok": true, "text": metrics_text(&st)})
         }
         "scale" => {
             let mut st = shared.state.lock().await;
@@ -1222,6 +1482,8 @@ mod tests {
             daemon_backoff: DAEMON_FIRST_BACKOFF,
             announced: BTreeSet::new(),
             started: Instant::now(),
+            usage: BTreeMap::new(),
+            crash_loops: BTreeMap::new(),
         };
         for n in 0..5 {
             assert!(st.pools["strong"].paused.is_none(), "paused after {n}");

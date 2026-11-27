@@ -390,6 +390,8 @@ pub async fn control(
         // Printed by the caller's error path.
     } else if req["op"] == "status" {
         print_status(&v);
+    } else if req["op"] == "metrics" {
+        print!("{}", v["text"].as_str().unwrap_or(""));
     } else {
         println!("{}", v["message"].as_str().unwrap_or("ok"));
     }

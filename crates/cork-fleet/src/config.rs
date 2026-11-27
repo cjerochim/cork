@@ -24,6 +24,7 @@ struct RawFleet {
     name: String,
     models: String,
     max_workers: Option<usize>,
+    metrics_port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +109,8 @@ impl Pool {
 pub struct Fleet {
     pub name: String,
     pub max_workers: usize,
+    /// Serve the supervisor's `/metrics` on this loopback port (18.4).
+    pub metrics_port: Option<u16>,
     pub pools: BTreeMap<String, Pool>,
     pub catalog: Catalog,
     pub models_path: PathBuf,
@@ -173,6 +176,7 @@ impl Fleet {
         Ok(Self {
             name: raw.fleet.name,
             max_workers,
+            metrics_port: raw.fleet.metrics_port,
             pools,
             catalog,
             models_path,

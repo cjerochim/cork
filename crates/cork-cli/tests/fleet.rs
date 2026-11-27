@@ -841,3 +841,76 @@ fn the_lead_pool_takes_features_and_a_restarted_lead_duplicates_nothing() {
         }
     }
 }
+
+#[test]
+fn the_supervisor_serves_metrics_with_the_usage_its_workers_report() {
+    // 18.4: workers per pool, restarts, unmatched tasks, and tokens and
+    // cost per pool and model, from the usage the wrappers report.
+    let e = Env::new();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let f = Fleet::up(
+        &e,
+        "m",
+        &format!(
+            "metrics_port = {port}\n[pool.cheap]\nmodel = \"haiku\"\nselect = \"work/\"\ncount = 2\ncommand = [\"sh\", \"-c\", \"printf '{{\\\"input_tokens\\\":100,\\\"output_tokens\\\":10,\\\"cost_usd\\\":0.25}}' > $CORK_USAGE; echo ok\"]\n"
+        ),
+    );
+    let ids: Vec<String> = (0..3)
+        .map(|i| create(&e, "work", &format!("t{i}"), &[]))
+        .collect();
+    for id in &ids {
+        e.wait_state(id, "completed", Duration::from_secs(20));
+    }
+    until("usage for 3 attempts", Duration::from_secs(5), || {
+        f.ctl(&e, &["metrics"]).contains(
+            "cork_fleet_usage_attempts_total{fleet=\"m\",pool=\"cheap\",model=\"haiku\"} 3",
+        )
+    });
+    let text = f.ctl(&e, &["metrics"]);
+    assert!(
+        text.contains("cork_fleet_cost_usd_total{fleet=\"m\",pool=\"cheap\",model=\"haiku\"} 0.75"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "cork_fleet_input_tokens_total{fleet=\"m\",pool=\"cheap\",model=\"haiku\"} 300"
+        )
+    );
+    assert!(
+        text.contains(
+            "cork_fleet_workers{fleet=\"m\",pool=\"cheap\",model=\"haiku\",state=\"idle\"} 2"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("cork_fleet_restarts_total{fleet=\"m\",pool=\"cheap\"} 0"));
+    assert!(text.contains("cork_fleet_unmatched_tasks{fleet=\"m\"} 0"));
+
+    // The same text over HTTP on the configured loopback port.
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(
+        resp.contains("cork_fleet_cost_usd_total{fleet=\"m\",pool=\"cheap\",model=\"haiku\"} 0.75")
+    );
+
+    // Each attempt also posted its usage reply on the board.
+    let t = e.json(&["read", &ids[0]]);
+    let u: Vec<&Value> = t["replies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["labels"]["usage"] == "attempt")
+        .collect();
+    assert_eq!(u.len(), 1);
+    assert_eq!(u[0]["data"]["model"], "haiku");
+    assert_eq!(u[0]["data"]["pool"], "cheap");
+    drop(f);
+}

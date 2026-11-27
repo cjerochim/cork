@@ -15,6 +15,8 @@ pub struct ServeOpts {
     pub db: PathBuf,
     pub full_sync: bool,
     pub import: Option<PathBuf>,
+    /// Label `/metrics` task gauges with channel names.
+    pub metrics_channels: bool,
 }
 
 /// A random 256-bit token, hex.
@@ -105,6 +107,12 @@ pub async fn serve(o: ServeOpts) -> Result<(), String> {
         BoardConfig {
             id: board_id,
             name: "cork".into(),
+            metrics_channels: o.metrics_channels,
+            wal_path: Some({
+                let mut w = o.db.clone().into_os_string();
+                w.push("-wal");
+                w.into()
+            }),
             ..Default::default()
         },
     )

@@ -464,6 +464,10 @@ impl Report {
             source,
         };
         let data = usage::record(agent, &a);
+        // Under a fleet, the supervisor totals usage for its own /metrics.
+        if let Some(p) = env("CORK_USAGE_REPORT") {
+            let _ = std::fs::write(p, data.to_string());
+        }
         let m = PostMessage {
             text: usage::summary(&data),
             labels: [(usage::LABEL_KEY.to_string(), usage::LABEL_VALUE.to_string())]
