@@ -4,7 +4,8 @@
 //! The wrapper keeps the claim in memory only. It never compares its clock
 //! with `expires_at`: it measures time since the server's last `now`.
 
-use cork_api::{ClaimOut, ClaimOutcome, ClaimReq, SettleReq};
+use crate::usage::{self, Parser};
+use cork_api::{ClaimOut, ClaimOutcome, ClaimReq, PostMessage, SettleReq};
 use cork_client::home::{Connect, reconnect};
 use cork_client::{Client, ClientError};
 use serde_json::Value;
@@ -16,6 +17,9 @@ use tokio::process::{Child, Command};
 
 const STDOUT_KEEP: usize = 16 * 1024;
 const STDERR_KEEP: usize = 2 * 1024;
+/// With a usage parser, the whole stdout is kept (up to this much), since
+/// the agent's final JSON can be long.
+const STDOUT_PARSE_KEEP: usize = 8 * 1024 * 1024;
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
 pub enum Target {
@@ -35,6 +39,8 @@ pub struct RunOpts {
     pub max_runtime: Option<Duration>,
     pub command: Vec<String>,
     pub json: bool,
+    /// Read usage from the command's output with this parser (18.2).
+    pub usage: Option<Parser>,
 }
 
 /// The exit codes of 8.6.
@@ -194,6 +200,7 @@ async fn run_one(
     let _ = std::fs::create_dir_all(&dir);
     let result_file = dir.join("result");
     let _ = std::fs::write(&result_file, b"");
+    let usage_file = dir.join("usage.json");
     let previous = if attempt > 1 {
         previous_notes(client, &task.id, attempt)
             .await
@@ -213,6 +220,7 @@ async fn run_one(
         .env("CORK_CLAIM", &held.claim_id)
         .env("CORK_ATTEMPT", attempt.to_string())
         .env("CORK_RESULT", &result_file)
+        .env("CORK_USAGE", &usage_file)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -249,7 +257,11 @@ async fn run_one(
             child.stdout.take().unwrap(),
             tokio::io::stdout(),
             out_tail.clone(),
-            STDOUT_KEEP,
+            if o.usage.is_some() {
+                STDOUT_PARSE_KEEP
+            } else {
+                STDOUT_KEEP
+            },
         )),
         tokio::spawn(pump(
             child.stderr.take().unwrap(),
@@ -260,6 +272,13 @@ async fn run_one(
     ];
 
     let started = Instant::now();
+    let report = Report {
+        task: task.id.clone(),
+        attempt,
+        file: usage_file.clone(),
+        parser: o.usage,
+        started,
+    };
     let renew_every = Duration::from_millis((held.lease_ms / 3).max(50) as u64);
     let mut next_renew = tokio::time::Instant::now() + renew_every;
     let mut backoff = Duration::from_millis(500);
@@ -303,11 +322,29 @@ async fn run_one(
                 let _ = p.await;
             }
             let written = std::fs::read_to_string(&result_file).unwrap_or_default();
+            let stdout = String::from_utf8_lossy(&out_tail.lock().unwrap()).into_owned();
+            let parsed = o.usage.and_then(|p| p.parse(&stdout));
+            let outcome = if status.success() {
+                "completed"
+            } else {
+                "failed"
+            };
+            report
+                .post(client, &held, outcome, status.code(), parsed.as_ref())
+                .await;
             if status.success() {
-                let result = if written.trim().is_empty() {
-                    String::from_utf8_lossy(&out_tail.lock().unwrap()).into_owned()
-                } else {
+                let result = if !written.trim().is_empty() {
                     written
+                } else if let Some(r) = parsed.and_then(|p| p.result) {
+                    r
+                } else if stdout.len() > STDOUT_KEEP {
+                    let mut cut = stdout.len() - STDOUT_KEEP;
+                    while !stdout.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    stdout[cut..].to_string()
+                } else {
+                    stdout
                 };
                 finish(
                     conn,
@@ -338,10 +375,12 @@ async fn run_one(
         Ended::Blocked => {
             // The agent asked a question. Let it finish; the task stays blocked.
             let _ = child.wait().await;
+            report.post(client, &held, "blocked", None, None).await;
             exit::BLOCKED
         }
         Ended::Lost => {
             stop(&mut child).await;
+            report.post(client, &held, "lost", None, None).await;
             eprintln!(
                 "cork: the claim on {} was lost; stopped the command",
                 held.task_id
@@ -357,6 +396,7 @@ async fn run_one(
         }
         Ended::MaxRuntime => {
             stop(&mut child).await;
+            report.post(client, &held, "max_runtime", None, None).await;
             let reason = format!(
                 "stopped after --max-runtime {:?}",
                 o.max_runtime.unwrap_or_default()
@@ -365,6 +405,7 @@ async fn run_one(
         }
         Ended::Signal(code) => {
             stop(&mut child).await;
+            report.post(client, &held, "released", None, None).await;
             let req = SettleReq {
                 claim_id: held.claim_id.clone(),
                 ..Default::default()
@@ -375,6 +416,76 @@ async fn run_one(
     };
     let _ = std::fs::remove_dir_all(&dir);
     code
+}
+
+/// Posts the attempt's usage reply (18.2) just before the wrapper settles.
+struct Report {
+    task: String,
+    attempt: u32,
+    file: std::path::PathBuf,
+    parser: Option<Parser>,
+    started: Instant,
+}
+
+impl Report {
+    /// Post one `usage=attempt` reply, if the command wrote `$CORK_USAGE` or
+    /// a parser was asked for. Failures are reported and ignored: usage
+    /// never changes how the task settles. The idempotency key makes a
+    /// retried post land once.
+    async fn post(
+        &self,
+        client: &Client,
+        held: &Held,
+        outcome: &'static str,
+        exit: Option<i32>,
+        parsed: Option<&usage::Parsed>,
+    ) {
+        let file = usage::read_file(&self.file);
+        if file.is_none() && self.parser.is_none() {
+            return;
+        }
+        let (agent, source) = match (file, parsed) {
+            // The command's own file wins over what a parser found.
+            (Some(f), _) => (f, Some("file".to_string())),
+            (None, Some(p)) => (p.usage.clone(), self.parser.map(|p| p.name().to_string())),
+            (None, None) => (Default::default(), None),
+        };
+        let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+        let a = usage::Attempt {
+            task: self.task.clone(),
+            attempt: self.attempt,
+            claim_id: held.claim_id.clone(),
+            profile: client.profile().map(str::to_string),
+            pool: env("CORK_POOL"),
+            model: env("CORK_MODEL"),
+            exit,
+            outcome,
+            duration_ms: self.started.elapsed().as_millis() as u64,
+            source,
+        };
+        let data = usage::record(agent, &a);
+        let m = PostMessage {
+            text: usage::summary(&data),
+            labels: [(usage::LABEL_KEY.to_string(), usage::LABEL_VALUE.to_string())]
+                .into_iter()
+                .collect(),
+            data: Some(data),
+        };
+        let key = format!("usage-{}", held.claim_id);
+        for _ in 0..3 {
+            match client.reply(&self.task, &m, Some(&key)).await {
+                Ok(_) => return,
+                Err(e) if e.is_transient() => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                Err(e) => {
+                    eprintln!("cork: could not post usage for {}: {e}", self.task);
+                    return;
+                }
+            }
+        }
+        eprintln!("cork: could not post usage for {}", self.task);
+    }
 }
 
 async fn finish_fail(
