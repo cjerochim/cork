@@ -45,6 +45,7 @@ macro_rules! contract_tests {
             lease_end_queries,
             idempotency_projection,
             max_at_and_head,
+            task_events_match_task_labels,
         );
     };
     (@each $make:expr; $($name:ident),* $(,)?) => {
@@ -154,21 +155,42 @@ pub fn post_commit(m: &Message) -> Commit {
     }
 }
 
-fn task_events(task: &Task, events: &[TaskEvent], actor: &str, now: Millis) -> Vec<NewEvent> {
+/// Task events carry `board.task=<state after the event>` (HANDOFF 6.3).
+/// `task` is the state before the first event, or `None` for a create.
+fn task_events(
+    task: Option<&Task>,
+    events: &[TaskEvent],
+    actor: &str,
+    now: Millis,
+) -> Vec<NewEvent> {
+    let mut state = task.cloned();
     events
         .iter()
         .map(|e| {
-            NewEvent::new(
+            let next = match &state {
+                None => Task::genesis(e, now).unwrap(),
+                Some(t) => {
+                    let mut t = t.clone();
+                    t.apply(e, now);
+                    t
+                }
+            };
+            let ev = NewEvent::new(
                 e.event_type(),
                 serde_json::to_value(e).unwrap(),
                 actor,
                 now,
                 EventMeta {
-                    channel: Some(task.channel.clone()),
-                    thread_id: Some(task.id.clone()),
-                    labels: vec![],
+                    channel: Some(next.channel.clone()),
+                    thread_id: Some(next.id.clone()),
+                    labels: vec![(
+                        cork_core::labels::TASK_LABEL.into(),
+                        next.state.as_str().into(),
+                    )],
                 },
-            )
+            );
+            state = Some(next);
+            ev
         })
         .collect()
 }
@@ -195,7 +217,7 @@ pub async fn create_task<S: Store>(
     commit.appends.push(StreamAppend {
         stream_id: task_stream(&task.id),
         expected: ExpectedVersion::NoStream,
-        events: task_events(&task, std::slice::from_ref(&created), "chris", now),
+        events: task_events(None, std::slice::from_ref(&created), "chris", now),
     });
     commit.projections.push(Projection::Task(task.clone()));
     commit.projections.push(Projection::SetMessageLabel {
@@ -232,7 +254,7 @@ where
                 appends: vec![StreamAppend {
                     stream_id: task_stream(&task.id),
                     expected: ExpectedVersion::Exact(task.version),
-                    events: task_events(&task, &d.events, "chris", now),
+                    events: task_events(Some(&task), &d.events, "chris", now),
                 }],
                 projections: vec![
                     Projection::Task(next.clone()),
@@ -388,6 +410,13 @@ pub async fn failed_commit_writes_no_projections<S: Store>(s: Arc<S>) {
 pub async fn positions_go_up<S: Store>(s: Arc<S>) {
     let mut last = 0;
     for i in 0..50 {
+        assert_eq!(
+            s.write(|tx| Ok((Commit::default(), tx.head()?)))
+                .await
+                .unwrap()
+                .1,
+            last
+        );
         let stream = format!("s:{}", i % 7);
         let out = put(
             &*s,
@@ -396,7 +425,7 @@ pub async fn positions_go_up<S: Store>(s: Arc<S>) {
         .await
         .unwrap();
         for e in out {
-            assert!(e.position > last);
+            assert_eq!(e.position, last + 1, "positions have no gaps");
             last = e.position;
         }
     }
@@ -1228,4 +1257,86 @@ pub async fn max_at_and_head<S: Store>(s: Arc<S>) {
         .unwrap();
     assert_eq!(s.max_at().await.unwrap(), Some(500));
     assert_eq!(s.head().await.unwrap(), 2);
+}
+
+/// A filter on a task's own label matches its task events, joined from the
+/// task, together with the `board.task` label each event stores (HANDOFF 6.3).
+pub async fn task_events_match_task_labels<S: Store>(s: Arc<S>) {
+    let t = create_task(&*s, "work", labels(&[("step", "fix")]), lease(60_000, 3), 1).await;
+    let other = create_task(&*s, "work", Labels::new(), lease(60_000, 3), 1).await;
+    decide(&*s, &t.id, 2, |t| {
+        t.claim(2, &worker("w"), "c".into(), None)
+    })
+    .await
+    .unwrap();
+    let out = s
+        .write({
+            let id = t.id.clone();
+            move |tx| {
+                let task = tx.get_task(&id)?.unwrap().task;
+                let d = task.complete(3, "c", Some("done".into()))?;
+                let events = task_events(Some(&task), &d.events, "chris", 3);
+                let mut next = task.clone();
+                for e in &d.events {
+                    next.apply(e, 3);
+                }
+                Ok((
+                    Commit {
+                        appends: vec![StreamAppend {
+                            stream_id: task_stream(&id),
+                            expected: ExpectedVersion::Exact(task.version),
+                            events,
+                        }],
+                        projections: vec![Projection::Task(next)],
+                    },
+                    (),
+                ))
+            }
+        })
+        .await
+        .unwrap()
+        .0;
+    // What `write` returns carries the joined labels too, so in-memory
+    // matching (the server's fan-out) agrees with the store.
+    assert!(out[0].meta.labels.contains(&("step".into(), "fix".into())));
+    let types = |l: Vec<(&str, &str)>| {
+        let s = s.clone();
+        let f = EventFilter {
+            stream_id: None,
+            labels: l
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            limit: 100,
+            ..Default::default()
+        };
+        async move {
+            let page = s.read_events(&f).await.unwrap();
+            for e in &page.events {
+                assert!(f.matches(e));
+            }
+            page.events
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        types(vec![("step", "fix")]).await,
+        [
+            "MessagePosted",
+            "TaskCreated",
+            "TaskClaimed",
+            "TaskCompleted"
+        ]
+    );
+    assert_eq!(
+        types(vec![("step", "fix"), ("board.task", "completed")]).await,
+        ["TaskCompleted"]
+    );
+    assert_eq!(
+        types(vec![("board.task", "ready")]).await,
+        ["TaskCreated", "TaskCreated"]
+    );
+    let _ = other;
 }

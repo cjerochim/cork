@@ -16,8 +16,9 @@
 //!    expects. With one writer this always holds, so a mismatch is a bug: the
 //!    adapter returns `internal` and writes nothing.
 //! 3. **Global order.** Positions are unique and only go up. Versions within a
-//!    stream are 1, 2, 3, … with no gaps. A reader that has seen position N
-//!    never later finds a new event below N.
+//!    stream are 1, 2, 3, … with no gaps, and so are positions: a commit's
+//!    events get `head + 1`, `head + 2`, … in append order. A reader that has
+//!    seen position N never later finds a new event below N.
 //! 4. **Read after a position.** [`Store::read_events`] returns the events
 //!    after position N that match a filter, in position order, from one read
 //!    transaction, with the highest position that transaction saw.
@@ -50,6 +51,11 @@ pub struct EventMeta {
     pub channel: Option<String>,
     pub thread_id: Option<String>,
     /// May repeat a key, such as one `board.mention` per handle.
+    ///
+    /// Events on a `task:{id}` stream store only `board.task`. When read back
+    /// (and in what [`Store::write`] returns) they also carry the task's own
+    /// labels, joined from the task, so `step=fix` matches task events
+    /// without copying labels onto each one (HANDOFF 6.3).
     pub labels: Vec<(String, String)>,
 }
 
@@ -273,6 +279,9 @@ pub struct StoredTask {
 /// Reads available inside a write. They see the transaction's own view, which
 /// is the latest committed state because there is one writer.
 pub trait WriteTx {
+    /// The highest committed position. This commit's events get `head + 1`,
+    /// `head + 2`, … in append order (positions have no gaps).
+    fn head(&mut self) -> Result<Position>;
     fn stream_version(&mut self, stream_id: &str) -> Result<u64>;
     fn get_message(&mut self, id: &str) -> Result<Option<Message>>;
     fn get_task(&mut self, id: &str) -> Result<Option<StoredTask>>;

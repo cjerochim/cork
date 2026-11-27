@@ -556,7 +556,9 @@ fn read_events(c: &Connection, f: &EventFilter) -> Result<EventPage> {
         let a = s.p(k.clone());
         let b = s.p(v.clone());
         s.and(format!(
-            "EXISTS (SELECT 1 FROM event_labels l WHERE l.key = {a} AND l.value = {b} AND l.position = e.position)"
+            "(EXISTS (SELECT 1 FROM event_labels l WHERE l.key = {a} AND l.value = {b} AND l.position = e.position) \
+             OR (substr(e.stream_id, 1, 5) = 'task:' AND EXISTS (SELECT 1 FROM task_labels tl \
+                 WHERE tl.task_id = e.thread_id AND tl.key = {a} AND tl.value = {b})))"
         ));
     }
     let lim = s.p(limit(f.limit));
@@ -649,6 +651,37 @@ fn load_event_labels(c: &Connection, events: &mut [StoredEvent]) -> Result<()> {
             events[i].meta.labels.push((k, v));
         }
     }
+    add_task_labels(c, events)
+}
+
+/// Task events store only `board.task`; join the task's own labels on read.
+fn add_task_labels(c: &Connection, events: &mut [StoredEvent]) -> Result<()> {
+    let mut cache: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for e in events.iter_mut() {
+        if !e.stream_id.starts_with("task:") {
+            continue;
+        }
+        let Some(task_id) = e.meta.thread_id.clone() else {
+            continue;
+        };
+        if !cache.contains_key(&task_id) {
+            let rows: Vec<(String, String)> = c
+                .prepare_cached(
+                    "SELECT key, value FROM task_labels WHERE task_id = ?1 ORDER BY key",
+                )
+                .sql()?
+                .query_map(params![task_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .sql()?
+                .collect::<rusqlite::Result<_>>()
+                .sql()?;
+            cache.insert(task_id.clone(), rows);
+        }
+        for l in &cache[&task_id] {
+            if !e.meta.labels.contains(l) {
+                e.meta.labels.push(l.clone());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -716,6 +749,9 @@ fn list_messages(c: &Connection, q: &MessageQuery) -> Result<Vec<StoredMessage>>
 struct Tx<'a>(&'a Connection);
 
 impl WriteTx for Tx<'_> {
+    fn head(&mut self) -> Result<Position> {
+        head(self.0)
+    }
     fn stream_version(&mut self, stream_id: &str) -> Result<u64> {
         stream_version(self.0, stream_id)
     }
@@ -772,6 +808,8 @@ fn apply_commit(tx: &Connection, commit: &Commit) -> Result<Vec<StoredEvent>> {
     let mut out = Vec::new();
     let mut first_pos: HashMap<&str, u64> = HashMap::new();
     let mut last_pos: HashMap<&str, u64> = HashMap::new();
+    // Positions are explicit so they never have gaps (see `WriteTx::head`).
+    let mut position = head(tx)?;
 
     for app in &commit.appends {
         let current = stream_version(tx, &app.stream_id)?;
@@ -791,11 +829,12 @@ fn apply_commit(tx: &Connection, commit: &Commit) -> Result<Vec<StoredEvent>> {
         for e in &app.events {
             version += 1;
             tx.prepare_cached(
-                "INSERT INTO events (stream_id, version, type, schema, data, actor, at, channel, thread_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO events (position, stream_id, version, type, schema, data, actor, at, channel, thread_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )
             .sql()?
             .execute(params![
+                (position + 1) as i64,
                 app.stream_id,
                 version as i64,
                 e.event_type,
@@ -807,7 +846,7 @@ fn apply_commit(tx: &Connection, commit: &Commit) -> Result<Vec<StoredEvent>> {
                 e.meta.thread_id
             ])
             .sql()?;
-            let position = tx.last_insert_rowid() as u64;
+            position += 1;
             {
                 let mut st = tx
                     .prepare_cached(
@@ -834,10 +873,7 @@ fn apply_commit(tx: &Connection, commit: &Commit) -> Result<Vec<StoredEvent>> {
         }
     }
 
-    let head_now = match out.last() {
-        Some(e) => e.position,
-        None => head(tx)?,
-    };
+    let head_now = position;
     for p in &commit.projections {
         match p {
             Projection::Message(m) => project_message(tx, m, &last_pos, head_now)?,
@@ -864,6 +900,7 @@ fn apply_commit(tx: &Connection, commit: &Commit) -> Result<Vec<StoredEvent>> {
             }
         }
     }
+    add_task_labels(tx, &mut out)?;
     Ok(out)
 }
 
