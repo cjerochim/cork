@@ -11,6 +11,7 @@
 
 use crate::clock::Clock;
 use cork_api::*;
+use cork_core::deps::{self, Settled};
 use cork_core::labels::{MENTION_LABEL, TASK_LABEL, parse_filter};
 use cork_core::message::{MESSAGE_POSTED, post_reply, post_root};
 use cork_core::{
@@ -184,6 +185,13 @@ pub struct Batch {
     handoffs: Vec<Handoff>,
     /// Tasks that changed state, for `/metrics`.
     moves: Vec<crate::metrics::Move>,
+    /// Every task this batch wrote, as it leaves it. Reads inside the write
+    /// look here first, because the transaction sees only committed rows.
+    tasks: HashMap<String, Task>,
+    /// Dependencies declared by tasks created in this batch: (dependent, id).
+    new_deps: Vec<(String, String)>,
+    /// Settles whose dependents still need the dependency rule (6.8.5).
+    settled: VecDeque<Settled>,
 }
 
 impl Batch {
@@ -196,7 +204,31 @@ impl Batch {
             ready: vec![],
             handoffs: vec![],
             moves: vec![],
+            tasks: HashMap::new(),
+            new_deps: vec![],
+            settled: VecDeque::new(),
         }
+    }
+
+    /// A task as this batch sees it: its own writes first, then the store.
+    pub fn get_task(&self, tx: &mut dyn WriteTx, id: &str) -> Result<Option<Task>> {
+        match self.tasks.get(id) {
+            Some(t) => Ok(Some(t.clone())),
+            None => Ok(tx.get_task(id)?.map(|t| t.task)),
+        }
+    }
+
+    fn load(&self, tx: &mut dyn WriteTx, id: &str) -> Result<Task> {
+        self.get_task(tx, id)?
+            .ok_or_else(|| BoardError::not_found(format!("task {id}")))
+    }
+
+    /// A [`deps::TaskLookup`] over this batch and its transaction.
+    fn look<'a>(
+        &'a self,
+        tx: &'a mut dyn WriteTx,
+    ) -> impl FnMut(&str) -> Result<Option<Task>> + 'a {
+        move |id: &str| self.get_task(&mut *tx, id)
     }
 
     fn push(&mut self, stream: String, expected: ExpectedVersion, events: Vec<NewEvent>) -> u64 {
@@ -245,6 +277,18 @@ impl Batch {
     /// Append task events and project the result. `before` is `None` for a
     /// create. Each event carries `board.task=<state after it>` (6.3).
     fn task(&mut self, before: Option<&Task>, events: &[TaskEvent], actor: &Actor) -> Result<Task> {
+        self.task_with(before, events, actor, vec![])
+    }
+
+    /// As [`Batch::task`], with extra index labels on every event (such as
+    /// `board.mention` on `DependencyFailed`).
+    fn task_with(
+        &mut self,
+        before: Option<&Task>,
+        events: &[TaskEvent],
+        actor: &Actor,
+        extra: Vec<(String, String)>,
+    ) -> Result<Task> {
         let mut state: Option<Task> = before.cloned();
         let mut out = Vec::with_capacity(events.len());
         for e in events {
@@ -263,7 +307,9 @@ impl Batch {
                 EventMeta {
                     channel: Some(next.channel.clone()),
                     thread_id: Some(next.id.clone()),
-                    labels: vec![(TASK_LABEL.into(), next.state.as_str().into())],
+                    labels: std::iter::once((TASK_LABEL.into(), next.state.as_str().into()))
+                        .chain(extra.iter().cloned())
+                        .collect(),
                 },
             ));
             state = Some(next);
@@ -291,7 +337,51 @@ impl Batch {
         if after.state == TaskState::Ready && !was_ready {
             self.ready.push(after.clone());
         }
+        if before.is_none() {
+            for d in &after.depends_on {
+                self.new_deps.push((after.id.clone(), d.clone()));
+            }
+        }
+        self.settled.extend(Settled::from_events(&after.id, events));
+        self.tasks.insert(after.id.clone(), after.clone());
         Ok(after)
+    }
+
+    /// Apply the dependency rule for every settle in this batch, in order:
+    /// ready the dependents whose last dependency just completed, and tell
+    /// waiting dependents when one failed (6.8.5, Decision 1). Runs at the
+    /// end of every write, before the hand-out, in its transaction.
+    fn propagate(&mut self, tx: &mut dyn WriteTx) -> Result<()> {
+        let system = Actor::system();
+        while let Some(settled) = self.settled.pop_front() {
+            let chain = deps::chain_back(&mut self.look(tx), &settled.id)?;
+            let mut ids = tx.dependents(&chain)?;
+            ids.extend(
+                self.new_deps
+                    .iter()
+                    .filter(|(_, d)| chain.contains(d))
+                    .map(|(t, _)| t.clone()),
+            );
+            if ids.is_empty() {
+                continue;
+            }
+            let mut dependents = Vec::with_capacity(ids.len());
+            for id in &ids {
+                dependents.push(self.load(tx, id)?);
+            }
+            let writes = deps::on_settled(&mut self.look(tx), &settled, dependents)?;
+            for (dependent, event) in writes {
+                let mut extra = vec![];
+                if matches!(event, TaskEvent::DependencyFailed { .. }) {
+                    let creator = self.message(tx, &dependent.id)?.map(|m| m.actor);
+                    for h in deps::mentions(&dependent, creator.as_ref()) {
+                        extra.push((MENTION_LABEL.to_string(), h));
+                    }
+                }
+                self.task_with(Some(&dependent), &[event], &system, extra)?;
+            }
+        }
+        Ok(())
     }
 
     fn remember(&mut self, person: &str, idem: &Idem, result: serde_json::Value) {
@@ -323,6 +413,13 @@ impl Batch {
         w.queue.retain(|x| !x.tx.is_closed());
         let ready = std::mem::take(&mut self.ready);
         for task in ready {
+            // The batch may have changed it since it became ready.
+            let Some(task) = self.tasks.get(&task.id).cloned() else {
+                continue;
+            };
+            if task.state != TaskState::Ready {
+                continue;
+            }
             let Some(i) = w.queue.iter().position(|x| x.wants(&task)) else {
                 continue;
             };
@@ -515,6 +612,7 @@ impl<S: Store> Board<S> {
             .write(move |tx| {
                 let mut b = Batch::new(tx.head()?, clock.now());
                 let value = f(tx, &mut b)?;
+                b.propagate(tx)?;
                 b.hand_out(tx, &waiters)?;
                 Ok((b.commit, (value, b.handoffs, b.moves)))
             })
@@ -652,7 +750,7 @@ impl<S: Store> Board<S> {
         req: CreateTaskReq,
     ) -> Result<serde_json::Value> {
         let actor = caller.actor.clone();
-        self.write_idem(caller, idem, move |_, b| {
+        self.write_idem(caller, idem, move |tx, b| {
             let mut root = post_root(
                 new_id(),
                 &req.channel,
@@ -664,7 +762,19 @@ impl<S: Store> Board<S> {
                 actor.clone(),
                 b.now,
             )?;
-            let created = Task::create(
+            let resolved =
+                deps::resolve_create(&mut b.look(tx), &req.depends_on, req.replaces.as_deref())?;
+            // A retry takes its old task's place in the same commit (6.8.3).
+            let replaced = match &req.replaces {
+                Some(old) => {
+                    let old = b.load(tx, old)?;
+                    let chain = deps::chain_len(&mut b.look(tx), &old.id)?;
+                    let d = old.replace(b.now, &actor, &root.id, chain)?;
+                    Some((old, d))
+                }
+                None => None,
+            };
+            let created = Task::create_with(
                 root.id.clone(),
                 &root.channel,
                 &actor,
@@ -674,9 +784,13 @@ impl<S: Store> Board<S> {
                     max_attempts: req.max_attempts,
                     assignee: req.assignee,
                 },
+                resolved,
             )?;
             let position = b.post(&root);
             let task = b.task(None, &[created], &actor)?;
+            if let Some((old, d)) = replaced {
+                b.task(Some(&old), &d.events, &actor)?;
+            }
             root.labels
                 .insert(TASK_LABEL.into(), task.state.as_str().into());
             Ok(TaskOut {
@@ -705,7 +819,11 @@ impl<S: Store> Board<S> {
             let lease = req.lease_ms;
             return self
                 .write_idem(caller, idem, move |tx, b| {
-                    let task = get_task(tx, &task_id)?;
+                    let task = b.load(tx, &task_id)?;
+                    if task.state == TaskState::Waiting {
+                        let view = deps::view(&mut b.look(tx), &task, b.now)?;
+                        return Err(deps::waiting_error(&task, &view));
+                    }
                     let d = task.claim(b.now, &holder, new_id(), lease)?;
                     let after = b.task(Some(&task), &d.events, &holder)?;
                     let root = b.message(tx, &after.id)?;
@@ -818,7 +936,7 @@ impl<S: Store> Board<S> {
     ) -> Result<serde_json::Value> {
         let actor = caller.actor.clone();
         self.write_idem(caller, idem, move |tx, b| {
-            let task = get_task(tx, &task_id)?;
+            let task = b.load(tx, &task_id)?;
             let now = b.now;
             let c = req.claim_id.as_str();
             let d: Decision = match op {
@@ -829,7 +947,10 @@ impl<S: Store> Board<S> {
                 Settle::Block => task.block(now, c, req.question.unwrap_or_default())?,
                 Settle::Unblock => task.unblock(now, &actor, req.note)?,
                 Settle::Cancel => task.cancel(now, &actor, req.reason)?,
-                Settle::Reopen => task.reopen(now, &actor)?,
+                Settle::Reopen => {
+                    let open = deps::open_dependencies(&mut b.look(tx), &task.depends_on)?;
+                    task.reopen(now, &actor, open)?
+                }
             };
             if d.replayed {
                 return Ok(SettleOut {
@@ -858,7 +979,7 @@ impl<S: Store> Board<S> {
             let system = Actor::system();
             let mut n = 0;
             for id in &ids {
-                let task = get_task(tx, id)?;
+                let task = b.load(tx, id)?;
                 if let Ok(d) = task.expire(b.now) {
                     b.task(Some(&task), &d.events, &system)?;
                     n += 1;
@@ -925,7 +1046,7 @@ impl<S: Store> Board<S> {
             self.write(move |tx, b| {
                 let system = Actor::system();
                 for id in &chunk {
-                    let task = get_task(tx, id)?;
+                    let task = b.load(tx, id)?;
                     if let Ok(d) = task.restart_grace(b.now) {
                         b.task(Some(&task), &d.events, &system)?;
                     }
@@ -1350,13 +1471,6 @@ fn to_new(p: PostMessage) -> NewMessage {
         labels: p.labels,
         data: p.data,
     }
-}
-
-fn get_task(tx: &mut dyn WriteTx, id: &str) -> Result<Task> {
-    Ok(tx
-        .get_task(id)?
-        .ok_or_else(|| BoardError::not_found(format!("task {id}")))?
-        .task)
 }
 
 /// Fold stored task events into the task as of the last one.

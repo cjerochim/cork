@@ -27,7 +27,8 @@ pub const RESTART_GRACE_REASON: &str = "daemon_restart";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
-    /// A task it needs has not completed. (Milestone 2.)
+    /// Waiting on tasks: at least one dependency is not met (HANDOFF 6.8).
+    /// Only the board moves a task out of it.
     Waiting,
     Ready,
     Claimed,
@@ -109,7 +110,8 @@ pub struct LastSettle {
     pub at: Millis,
 }
 
-/// Events in a `task:{id}` stream. Every type is at schema version 1.
+/// Events in a `task:{id}` stream. `TaskCreated` and `TaskReopened` are at
+/// schema 2 (they gained the dependency fields); every other type is at 1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TaskEvent {
@@ -123,6 +125,16 @@ pub enum TaskEvent {
         max_attempts: u32,
         #[serde(default)]
         labels: Labels,
+        /// The tasks this one waits for, as declared (HANDOFF 6.8.1).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        depends_on: Vec<String>,
+        /// The task this one takes over (6.8.3).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaces: Option<String>,
+        /// The declared ids whose head was not `completed` when the task was
+        /// created. Not empty means the task starts `waiting` (6.8.4).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        open_dependencies: Vec<String>,
     },
     TaskClaimed {
         claim_id: String,
@@ -169,10 +181,35 @@ pub enum TaskEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
-    TaskReopened {},
-    /// Milestone 2. Reserved so the log format is stable.
-    NeedsChanged {
-        needs: Vec<String>,
+    TaskReopened {
+        /// Dependencies not met when it was reopened (6.8.4).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        open_dependencies: Vec<String>,
+    },
+    /// The task was taken over by `by`, which declared `replaces` (6.8.3).
+    /// It ends the task: `canceled`, unless it was already failed or canceled.
+    TaskReplaced {
+        by: String,
+    },
+    /// Written by the board when a waiting task's last unmet dependency is
+    /// met, in the commit of the completion that met it (6.8.1).
+    DependenciesMet {
+        met_by: String,
+    },
+    /// Written by the board on a waiting task when the head of one of its
+    /// dependencies fails or is canceled. The task stays waiting (6.8.10).
+    DependencyFailed {
+        /// The id the task declared.
+        dependency: String,
+        /// The task it resolved to, which ended.
+        head: String,
+        state: TaskState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Reserved, never written (6.8.11). Was `NeedsChanged`; no log holds it.
+    DependenciesChanged {
+        depends_on: Vec<String>,
     },
 }
 
@@ -190,7 +227,10 @@ impl TaskEvent {
             TaskEvent::TaskUnblocked { .. } => "TaskUnblocked",
             TaskEvent::TaskCanceled { .. } => "TaskCanceled",
             TaskEvent::TaskReopened { .. } => "TaskReopened",
-            TaskEvent::NeedsChanged { .. } => "NeedsChanged",
+            TaskEvent::TaskReplaced { .. } => "TaskReplaced",
+            TaskEvent::DependenciesMet { .. } => "DependenciesMet",
+            TaskEvent::DependencyFailed { .. } => "DependencyFailed",
+            TaskEvent::DependenciesChanged { .. } => "DependenciesChanged",
         }
     }
 }
@@ -242,6 +282,15 @@ pub struct Task {
     pub lease_ms: i64,
     pub max_attempts: u32,
     pub labels: Labels,
+    /// The tasks it waits for, as declared at creation (6.8.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// The task this one took over (6.8.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
+    /// The task that took this one over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
     /// The stored state. Use [`Task::effective_state`] for what it is now.
     pub state: TaskState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,6 +335,26 @@ impl Task {
         labels: Labels,
         input: &CreateTask,
     ) -> Result<TaskEvent> {
+        Self::create_with(
+            task_id,
+            channel,
+            owner,
+            labels,
+            input,
+            crate::deps::Resolved::default(),
+        )
+    }
+
+    /// Decide `TaskCreated` with dependencies already resolved by
+    /// [`crate::deps::resolve_create`] (HANDOFF 6.8.4).
+    pub fn create_with(
+        task_id: String,
+        channel: &str,
+        owner: &Actor,
+        labels: Labels,
+        input: &CreateTask,
+        deps: crate::deps::Resolved,
+    ) -> Result<TaskEvent> {
         let lease_ms = input.lease_ms.unwrap_or(DEFAULT_LEASE_MS);
         check_lease(lease_ms)?;
         let max_attempts = input.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
@@ -306,6 +375,9 @@ impl Task {
             lease_ms,
             max_attempts,
             labels,
+            depends_on: deps.depends_on,
+            replaces: deps.replaces,
+            open_dependencies: deps.open,
         })
     }
 
@@ -334,6 +406,9 @@ impl Task {
                 lease_ms,
                 max_attempts,
                 labels,
+                depends_on,
+                replaces,
+                open_dependencies,
             } => Ok(Task {
                 id: task_id.clone(),
                 channel: channel.clone(),
@@ -342,7 +417,14 @@ impl Task {
                 lease_ms: *lease_ms,
                 max_attempts: *max_attempts,
                 labels: labels.clone(),
-                state: TaskState::Ready,
+                depends_on: depends_on.clone(),
+                replaces: replaces.clone(),
+                replaced_by: None,
+                state: if open_dependencies.is_empty() {
+                    TaskState::Ready
+                } else {
+                    TaskState::Waiting
+                },
                 claim: None,
                 attempts: 0,
                 result: None,
@@ -374,7 +456,9 @@ impl Task {
         self.version += 1;
         self.updated_at = at;
         match e {
-            TaskEvent::TaskCreated { .. } | TaskEvent::NeedsChanged { .. } => {}
+            TaskEvent::TaskCreated { .. }
+            | TaskEvent::DependenciesChanged { .. }
+            | TaskEvent::DependencyFailed { .. } => {}
             TaskEvent::TaskClaimed {
                 claim_id,
                 holder,
@@ -436,8 +520,22 @@ impl Task {
                 self.state = TaskState::Canceled;
                 self.reason = reason.clone();
             }
-            TaskEvent::TaskReopened {} => {
+            TaskEvent::TaskReplaced { by } => {
+                self.replaced_by = Some(by.clone());
+                self.claim = None;
+                if !matches!(self.state, TaskState::Failed | TaskState::Canceled) {
+                    self.state = TaskState::Canceled;
+                }
+            }
+            TaskEvent::DependenciesMet { .. } => {
                 self.state = TaskState::Ready;
+            }
+            TaskEvent::TaskReopened { open_dependencies } => {
+                self.state = if open_dependencies.is_empty() {
+                    TaskState::Ready
+                } else {
+                    TaskState::Waiting
+                };
                 self.attempts = 0;
                 self.result = None;
                 self.reason = None;
@@ -727,16 +825,63 @@ impl Task {
         })
     }
 
-    pub fn reopen(&self, now: Millis, actor: &Actor) -> Result<Decision> {
+    /// Reopen a finished task. `open_dependencies` are its dependencies
+    /// that are not met now ([`crate::deps::open_dependencies`]); with any,
+    /// it goes back to `waiting` (6.8.5).
+    pub fn reopen(
+        &self,
+        now: Millis,
+        actor: &Actor,
+        open_dependencies: Vec<String>,
+    ) -> Result<Decision> {
         self.decide(now, |t| {
             t.require_owner(actor)?;
+            if let Some(by) = &t.replaced_by {
+                return Err(BoardError::new(
+                    ErrorCode::InvalidState,
+                    format!("task {} was replaced by {by}; reopen {by} instead", t.id),
+                ));
+            }
             if !t.state.is_terminal() {
                 return Err(BoardError::new(
                     ErrorCode::InvalidState,
                     format!("task {} is {}; only finished tasks reopen", t.id, t.state),
                 ));
             }
-            Ok(Decision::of(vec![TaskEvent::TaskReopened {}]))
+            Ok(Decision::of(vec![TaskEvent::TaskReopened {
+                open_dependencies,
+            }]))
+        })
+    }
+
+    /// Record that `by` takes this task's place (6.8.3). Only the owner may,
+    /// never while a worker holds it or once it completed, and only once.
+    /// `chain` is how many replacements already lead to this task.
+    pub fn replace(&self, now: Millis, actor: &Actor, by: &str, chain: usize) -> Result<Decision> {
+        self.decide(now, |t| {
+            t.require_owner(actor)?;
+            if let Some(prev) = &t.replaced_by {
+                return Err(BoardError::new(
+                    ErrorCode::InvalidState,
+                    format!("task {} was already replaced by {prev}; replace {prev} instead", t.id),
+                ));
+            }
+            if matches!(t.state, TaskState::Claimed | TaskState::Completed) {
+                return Err(BoardError::new(
+                    ErrorCode::InvalidState,
+                    format!("task {} is {}; only a task nobody holds and that did not complete can be replaced", t.id, t.state),
+                ));
+            }
+            if chain >= crate::deps::MAX_REPLACEMENTS {
+                return Err(BoardError::new(
+                    ErrorCode::InvalidState,
+                    format!(
+                        "task {} is already at the end of {chain} replacements, the most allowed",
+                        t.id
+                    ),
+                ));
+            }
+            Ok(Decision::of(vec![TaskEvent::TaskReplaced { by: by.to_string() }]))
         })
     }
 
@@ -887,7 +1032,15 @@ mod tests {
             )),
             ErrorCode::InvalidInput
         );
-        assert!(Task::genesis(&TaskEvent::TaskReopened {}, T0).is_err());
+        assert!(
+            Task::genesis(
+                &TaskEvent::TaskReopened {
+                    open_dependencies: vec![]
+                },
+                T0
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1059,7 +1212,7 @@ mod tests {
         let mut t = claimed(3);
         let d = t.complete(T0, "c1", None);
         run(&mut t, T0, d).unwrap();
-        let d = t.reopen(T0, &owner());
+        let d = t.reopen(T0, &owner(), vec![]);
         run(&mut t, T0, d).unwrap();
         assert_eq!(code(t.complete(T0, "c1", None)), ErrorCode::ClaimLost);
     }
@@ -1212,11 +1365,17 @@ mod tests {
     #[test]
     fn reopen_rules() {
         let mut t = claimed(1);
-        assert_eq!(code(t.reopen(T0, &owner())), ErrorCode::InvalidState);
+        assert_eq!(
+            code(t.reopen(T0, &owner(), vec![])),
+            ErrorCode::InvalidState
+        );
         let after = T0 + LEASE + 1;
-        assert_eq!(code(t.reopen(after, &stranger())), ErrorCode::TaskNotOwned);
+        assert_eq!(
+            code(t.reopen(after, &stranger(), vec![])),
+            ErrorCode::TaskNotOwned
+        );
         // Exhausted by lease end, not yet recorded: reopen records it first.
-        let d = t.reopen(after, &owner());
+        let d = t.reopen(after, &owner(), vec![]);
         let events = run(&mut t, after, d).unwrap();
         assert_eq!(
             types(&events),

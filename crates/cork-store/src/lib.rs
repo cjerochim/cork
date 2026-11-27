@@ -135,7 +135,8 @@ pub enum Projection {
     Message(Message),
     /// Insert or replace a task. On insert, its queue place
     /// (`created_position`) is the position of the first event this commit
-    /// appends to `task:{id}`, and its labels are indexed.
+    /// appends to `task:{id}`, and its labels and declared dependencies
+    /// (`depends_on`, fixed at creation) are indexed.
     Task(Task),
     /// Set one label on a stored message, replacing any value for that key.
     SetMessageLabel {
@@ -290,6 +291,9 @@ pub trait WriteTx {
     fn list_tasks(&mut self, q: &TaskQuery) -> Result<Vec<StoredTask>>;
     /// Ids of tasks stored as claimed whose lease ended before `now`, soonest first.
     fn ended_leases(&mut self, now: Millis, limit: usize) -> Result<Vec<String>>;
+    /// Ids of the tasks that declared a dependency on any of `ids`, oldest
+    /// first (`created_position`), without repeats (HANDOFF 6.8.6).
+    fn dependents(&mut self, ids: &[String]) -> Result<Vec<String>>;
     fn get_idempotency(&mut self, person: &str, key: &str) -> Result<Option<IdempotencyRecord>>;
 }
 
@@ -323,6 +327,8 @@ pub trait Store: Send + Sync + 'static {
     async fn next_lease_end(&self) -> Result<Option<Millis>>;
     /// Ids of every task stored as claimed (restart grace walks these).
     async fn claimed_tasks(&self) -> Result<Vec<String>>;
+    /// As [`WriteTx::dependents`], for reads.
+    async fn dependents(&self, ids: &[String]) -> Result<Vec<String>>;
 
     /// Delete idempotency rows created before `before`. Returns how many.
     async fn prune_idempotency(&self, before: Millis) -> Result<u64>;

@@ -104,6 +104,15 @@ CREATE TABLE IF NOT EXISTS task_labels (
   PRIMARY KEY (key, value, task_id)
 ) WITHOUT ROWID;
 
+-- Declared dependencies, fixed at creation (HANDOFF 6.8.6). Replacement
+-- links live in each task's body; chains are at most 16 long.
+CREATE TABLE IF NOT EXISTS task_dependencies (
+  task_id    TEXT NOT NULL,
+  depends_on TEXT NOT NULL,
+  PRIMARY KEY (task_id, depends_on)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS task_dependencies_by_dependency ON task_dependencies (depends_on, task_id);
+
 CREATE TABLE IF NOT EXISTS idempotency (
   person       TEXT    NOT NULL,
   key          TEXT    NOT NULL,
@@ -512,6 +521,27 @@ fn ended_leases(c: &Connection, now: Millis, n: usize) -> Result<Vec<String>> {
     .sql()
 }
 
+fn dependents(c: &Connection, ids: &[String]) -> Result<Vec<String>> {
+    let mut found: Vec<(i64, String)> = vec![];
+    let mut st = c
+        .prepare_cached(
+            "SELECT t.created_position, d.task_id FROM task_dependencies d \
+             JOIN tasks t ON t.id = d.task_id WHERE d.depends_on = ?1",
+        )
+        .sql()?;
+    for id in ids {
+        for r in st
+            .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .sql()?
+        {
+            found.push(r.sql()?);
+        }
+    }
+    found.sort();
+    found.dedup();
+    Ok(found.into_iter().map(|(_, id)| id).collect())
+}
+
 fn get_idempotency(c: &Connection, person: &str, key: &str) -> Result<Option<IdempotencyRecord>> {
     let row: Option<(String, String, i64)> = c
         .prepare_cached(
@@ -764,6 +794,9 @@ impl WriteTx for Tx<'_> {
     fn list_tasks(&mut self, q: &TaskQuery) -> Result<Vec<StoredTask>> {
         list_tasks(self.0, q)
     }
+    fn dependents(&mut self, ids: &[String]) -> Result<Vec<String>> {
+        dependents(self.0, ids)
+    }
     fn ended_leases(&mut self, now: Millis, limit: usize) -> Result<Vec<String>> {
         ended_leases(self.0, now, limit)
     }
@@ -960,12 +993,13 @@ fn write_derived(tx: &Connection, events: &[StoredEvent]) -> Result<()> {
     Ok(())
 }
 
-const PROJECTION_TABLES: [&str; 5] = [
+const PROJECTION_TABLES: [&str; 6] = [
     "messages",
     "message_labels",
     "channels",
     "tasks",
     "task_labels",
+    "task_dependencies",
 ];
 
 impl SqliteStore {
@@ -1123,6 +1157,14 @@ fn project_task(tx: &Connection, t: &Task, created: u64) -> Result<()> {
     for (k, v) in &t.labels {
         st.execute(params![k, v, t.id]).sql()?;
     }
+    let mut st = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on) VALUES (?1, ?2)",
+        )
+        .sql()?;
+    for d in &t.depends_on {
+        st.execute(params![t.id, d]).sql()?;
+    }
     Ok(())
 }
 
@@ -1255,6 +1297,11 @@ impl Store for SqliteStore {
             .sql()
         })
         .await
+    }
+
+    async fn dependents(&self, ids: &[String]) -> Result<Vec<String>> {
+        let ids = ids.to_vec();
+        self.read(move |c| dependents(c, &ids)).await
     }
 
     async fn prune_idempotency(&self, before: Millis) -> Result<u64> {

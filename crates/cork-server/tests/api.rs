@@ -693,6 +693,7 @@ async fn export_is_the_whole_log() {
     assert_eq!(lines.len(), 3);
     for (i, l) in lines.iter().enumerate() {
         assert_eq!(l["position"], i as u64 + 1);
-        assert_eq!(l["schema"], 1);
+        let t = l["type"].as_str().unwrap();
+        assert_eq!(l["schema"], cork_core::schema::current(t));
     }
 }

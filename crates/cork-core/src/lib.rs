@@ -6,6 +6,7 @@
 
 pub mod actor;
 pub mod channel;
+pub mod deps;
 pub mod error;
 pub mod labels;
 pub mod message;

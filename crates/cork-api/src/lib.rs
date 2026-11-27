@@ -168,6 +168,12 @@ pub struct CreateTaskReq {
     /// Only this handle may claim it (`--for`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// Ids of tasks this one waits for (`--after`, HANDOFF 6.8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// The task this retry takes over (`--replaces`, 6.8.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
 }
 
 /// One task. `task.state` is the effective state at `now`.
