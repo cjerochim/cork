@@ -71,3 +71,37 @@ async fn a_panicking_write_is_internal_and_the_writer_keeps_going() {
     put(&s, commit(1)).await.unwrap();
     assert_eq!(s.head().await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn rebuild_from_the_log_matches_the_live_projections() {
+    use cork_core::{Actor, CreateTask, Labels};
+    use cork_store::testkit::{create_task, decide};
+    let dir = tempfile::tempdir().unwrap();
+    let s = SqliteStore::open(SqliteConfig::new(dir.path().join("b.db")))
+        .await
+        .unwrap();
+    let mut l = Labels::new();
+    l.insert("step".into(), "fix".into());
+    let input = CreateTask {
+        lease_ms: Some(1_000),
+        max_attempts: Some(3),
+        assignee: None,
+    };
+    let a = create_task(&s, "work", l.clone(), input.clone(), 1).await;
+    let b = create_task(&s, "work/x", Labels::new(), input, 2).await;
+    let w = Actor::new("chris", Some("w".into())).unwrap();
+    decide(&s, &a.id, 3, move |t| t.claim(3, &w, "c".into(), None))
+        .await
+        .unwrap();
+    decide(&s, &a.id, 4, |t| t.complete(4, "c", Some("ok".into())))
+        .await
+        .unwrap();
+    decide(&s, &b.id, 5, |t| t.cancel(5, &Actor::person("chris"), None))
+        .await
+        .unwrap();
+    let before = s.projection_dump().await.unwrap();
+    assert!(!before.is_empty());
+    s.rebuild_projections().await.unwrap();
+    let after = s.projection_dump().await.unwrap();
+    assert_eq!(before, after);
+}

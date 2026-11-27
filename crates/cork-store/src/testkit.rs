@@ -46,6 +46,7 @@ macro_rules! contract_tests {
             idempotency_projection,
             max_at_and_head,
             task_events_match_task_labels,
+            import_keeps_positions,
         );
     };
     (@each $make:expr; $($name:ident),* $(,)?) => {
@@ -1339,4 +1340,76 @@ pub async fn task_events_match_task_labels<S: Store>(s: Arc<S>) {
         ["TaskCreated", "TaskCreated"]
     );
     let _ = other;
+}
+
+/// Import loads a log into an empty store, positions kept, and builds the
+/// projections from it (HANDOFF 13.4).
+pub async fn import_keeps_positions<S: Store>(s: Arc<S>) {
+    let m = root("work", "imported", labels(&[("step", "fix")]), 10);
+    let created = Task::create(
+        m.id.clone(),
+        "work",
+        &Actor::person("chris"),
+        m.labels.clone(),
+        &lease(60_000, 3),
+    )
+    .unwrap();
+    let task = Task::genesis(&created, 10).unwrap();
+    let claim = task
+        .claim(20, &worker("w"), "c1".into(), None)
+        .unwrap()
+        .events;
+    let mut new_events = vec![message_event(&m)];
+    new_events.extend(task_events(
+        None,
+        std::slice::from_ref(&created),
+        "chris",
+        10,
+    ));
+    new_events.extend(task_events(Some(&task), &claim, "w via chris", 20));
+    let streams = [
+        thread_stream(&m.thread_id),
+        task_stream(&m.id),
+        task_stream(&m.id),
+    ];
+    let log: Vec<StoredEvent> = new_events
+        .into_iter()
+        .zip(streams)
+        .enumerate()
+        .map(|(i, (e, stream))| StoredEvent {
+            position: i as u64 + 1,
+            version: if i == 2 { 2 } else { 1 },
+            stream_id: stream,
+            event_type: e.event_type,
+            schema: e.schema,
+            data: e.data,
+            actor: e.actor,
+            at: e.at,
+            meta: e.meta,
+        })
+        .collect();
+    s.import(log.clone()).await.unwrap();
+    let back = s.read_events(&EventFilter::after(0, 100)).await.unwrap();
+    assert_eq!(back.head, 3);
+    for (a, b) in log.iter().zip(&back.events) {
+        assert_eq!(
+            (a.position, &a.stream_id, a.version, &a.data),
+            (b.position, &b.stream_id, b.version, &b.data)
+        );
+    }
+    let stored = s.get_task(&m.id).await.unwrap().unwrap();
+    assert_eq!(stored.created_position, 2);
+    assert_eq!(stored.task.state, TaskState::Claimed);
+    assert_eq!(
+        s.get_message(&m.id, 30).await.unwrap().unwrap().labels["board.task"],
+        "claimed"
+    );
+    assert_eq!(s.next_lease_end().await.unwrap(), Some(20 + 60_000));
+    // Writes continue after the imported head.
+    let out = put(&*s, one("s:x", ExpectedVersion::NoStream, vec![ev("A", 1)]))
+        .await
+        .unwrap();
+    assert_eq!(out[0].position, 4);
+    // Import only goes into an empty store.
+    assert!(s.import(log).await.is_err());
 }
