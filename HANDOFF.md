@@ -411,6 +411,8 @@ cork wait work/ --type DependenciesMet --type DependencyFailed
 
 `--after` and `--replaces` take ids only. In a plan file, tasks refer to each other by key.
 
+As built: `dependents` and `waiting_on=<id>` resolve `<id>` to its head first, so asking about a replaced task lists what now waits on its replacement. `stuck` appears only when true. A plan task may carry `needs`, `for`, `channel`, `lease_ms` and `max_attempts`; the CLI turns `needs` into labels with the model catalog before it sends the plan (the server refuses `needs` it would otherwise ignore). A plan holds at most 1,000 tasks, created in dependency order, reported in file order.
+
 #### 6.8.8 Plans from a file
 
 A plan declares a set of tasks and how they relate. The board creates them all in one commit.
@@ -453,7 +455,7 @@ Done when, beside unit tests in `cork-core` for every rule in 6.8.5:
 - **Fan-out:** 1,000 tasks waiting on one task all ready in its completion commit. Claims waiting before it are served first come, first served.
 - **Chain:** a chain of 100 tasks run by 10 workers completes in order, and no task is ever claimed before its dependency completed.
 - **Escalation:** a task with 10 waiting dependents fails, is replaced twice, and the second retry completes. All 10 ready in that commit, and none was ever written to in between except by `DependencyFailed`.
-- **Chaos:** the chaos stress run (11, Done when 13) with random dependencies and random replacements. Invariants 1 to 8 hold.
+- **Chaos:** the chaos stress run (11, Done when 13) with random dependencies and random replacements. Invariants 1 to 8 hold. Built as `cork-stress deps`: up to 3 random dependencies per task, plans of 5, 1 in 20 tasks replaced at random, hard tasks failing once, workers vanishing mid-lease, and a lead replacing every failed head.
 - **Replay:** `show --at` at each position of a waiting, met, claimed, completed task, and of a replaced one, matches the log. `debug rebuild` and `export` / `serve --import` keep both projections and every state.
 
 #### 6.8.10 Decisions confirmed by Chris (2026-11-27)
@@ -469,7 +471,7 @@ When the head of a dependency ends `failed` or `canceled`, the dependent stays `
 **Decision 2 (confirmed). The results of dependencies are passed to the dependent.**
 
 - The claim response gains `dependencies: [{ task_id, head, text, result, completed_at, holder }]`, with the result of each head's latest `TaskCompleted`. `text` is the first 2 KB of the head's root message.
-- `tasks run` writes them to a JSON file and sets `CORK_DEPENDENCIES` to its path, beside `CORK_PREVIOUS` (9). Up to 64 results of 64 KB each is at most 4 MB, so a file, not an environment variable.
+- `tasks run` writes them to a JSON file and sets `CORK_DEPENDENCIES` to its path, beside `CORK_PREVIOUS` (9). `holder` and `completed_at` come from two fields the task now keeps, `completed_by` and `completed_at`, set by its latest `TaskCompleted` and cleared on reopen. Up to 64 results of 64 KB each is at most 4 MB, so a file, not an environment variable.
 - **Trust:** results are written by other agents, so they are notes, not instructions, as `CORK_PREVIOUS` is (9.1). The worker skill says so.
 - This is derived at claim time from what is in the log, so a plan never has to copy results into later tasks' text.
 

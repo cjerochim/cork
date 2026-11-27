@@ -732,29 +732,20 @@ fn escalation_scenario_retries_one_tier_up_from_the_old_branch() {
     );
     assert_eq!(t["task"]["labels"]["parent"], feature.as_str());
     assert_eq!(t["task"]["labels"]["needs.tier-2"], "yes");
-    // The history reads both ways: one link reply in the old thread.
-    let thread = e.json(&["read", &old]);
-    let links: Vec<&Value> = thread["replies"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|r| {
-            r["text"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("Escalated to {retry}"))
-        })
-        .collect();
-    assert_eq!(links.len(), 1);
+    // The board links both ways (HANDOFF 6.8.3): no reply is needed.
+    let shown = e.json(&["tasks", "show", &old]);
+    assert_eq!(shown["task"]["replaced_by"], retry.as_str());
+    assert_eq!(
+        shown["task"]["state"], "failed",
+        "a failed task stays failed"
+    );
+    assert_eq!(t["task"]["replaces"], old.as_str());
     // Both children show under the feature.
     let kids = e.json(&["tasks", "list", "--label", &parent]);
     assert_eq!(kids["tasks"].as_array().unwrap().len(), 2);
-    // The second escalation goes to tier 3; a third is refused.
-    let r2 = e.json(&["tasks", "escalate", &retry, "--config", &cfg]);
-    assert_eq!(r2["tier"], 3);
-    let r2 = r2["retry"].as_str().unwrap().to_string();
-    e.wait_state(&r2, "completed", Duration::from_secs(20));
-    e.expect(3, &["tasks", "escalate", &r2, "--config", &cfg]);
+    // Finished work is never redone through a replacement (HANDOFF 6.8.3);
+    // the tier limits are covered in cork-fleet's escalation tests.
+    e.expect(3, &["tasks", "escalate", &retry, "--config", &cfg]);
 }
 
 #[test]
@@ -766,12 +757,7 @@ fn escalating_a_ready_task_cancels_it() {
     assert_eq!(r["canceled_old"], true);
     assert_eq!(e.state(&old), "canceled");
     let t = e.json(&["tasks", "show", &old]);
-    assert!(
-        t["task"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("escalated to")
-    );
+    assert_eq!(t["task"]["replaced_by"], r["retry"]);
 }
 
 /// A fake lead: plans three children under idempotency keys, sleeps on its

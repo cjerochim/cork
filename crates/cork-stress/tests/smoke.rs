@@ -58,3 +58,8 @@ async fn lead() {
     r.print();
     assert!(r.passed(), "{:?}", r.failures);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deps() {
+    go(Scenario::Deps).await;
+}

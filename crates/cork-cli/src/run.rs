@@ -213,6 +213,18 @@ async fn run_one(
         None
     };
 
+    // Results of the tasks this one waited on (HANDOFF 6.8.10, Decision 2).
+    // A file, not a variable: up to 64 results of 64 KB each.
+    let dependencies = if c.dependencies.is_empty() {
+        None
+    } else {
+        let p = dir.join("dependencies.json");
+        match serde_json::to_vec_pretty(&c.dependencies) {
+            Ok(bytes) if std::fs::write(&p, &bytes).is_ok() => Some(p),
+            _ => None,
+        }
+    };
+
     let mut cmd = Command::new(&o.command[0]);
     cmd.args(&o.command[1..])
         .env("CORK_TASK", &task.id)
@@ -230,6 +242,9 @@ async fn run_one(
     }
     if let Some(p) = &previous {
         cmd.env("CORK_PREVIOUS", p);
+    }
+    if let Some(p) = &dependencies {
+        cmd.env("CORK_DEPENDENCIES", p);
     }
     // If this wrapper is killed (kill -9, or its fleet's supervisor dies),
     // the command stops too instead of working on a task nobody holds.

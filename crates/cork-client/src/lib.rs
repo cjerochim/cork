@@ -240,6 +240,10 @@ impl Client {
         self.post("/tasks", req, key).await
     }
 
+    pub async fn create_plan(&self, req: &PlanReq, key: Option<&str>) -> Result<Value> {
+        self.post("/tasks/plan", req, key).await
+    }
+
     pub async fn claim(&self, req: &ClaimReq, key: Option<&str>) -> Result<ClaimOut> {
         let wait = Duration::from_millis(req.wait_ms.unwrap_or(0));
         let v = self.post_wait("/tasks/claim", req, key, wait).await?;

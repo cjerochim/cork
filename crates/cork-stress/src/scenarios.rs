@@ -19,6 +19,8 @@ pub enum Scenario {
     Soak,
     /// A fake lead and fake workers through 100 features (HANDOFF 17.5).
     Lead,
+    /// Random dependencies and replacements under failing workers (6.8.9).
+    Deps,
 }
 
 /// Sizes for a run. `scale` shrinks counts and durations for quick runs.
@@ -97,6 +99,7 @@ pub async fn run(s: Scenario, p: &Params) -> Report {
         Scenario::Waiters => waiters(p).await,
         Scenario::Soak => soak(p).await,
         Scenario::Lead => crate::lead::lead(p).await,
+        Scenario::Deps => crate::deps::deps(p).await,
     }
 }
 

@@ -7,6 +7,7 @@
 
 pub mod client;
 pub mod daemon;
+pub mod deps;
 pub mod invariants;
 pub mod lead;
 pub mod scenarios;

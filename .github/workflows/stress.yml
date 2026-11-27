@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       scenario:
-        description: "throughput, contention, chaos, waiters, soak, lead, or empty for all"
+        description: "throughput, contention, chaos, waiters, soak, lead, deps, or empty for all"
         required: false
         default: ""
       soak_secs:

@@ -14,7 +14,7 @@ use cork_client::{Client, ClientError, query};
 use cork_core::Labels;
 use cork_core::channel::looks_like_ulid;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -274,6 +274,12 @@ enum TaskCmd {
         state: Option<String>,
         #[arg(long = "label")]
         labels: Vec<String>,
+        /// Only tasks with a dependency that resolves to this task.
+        #[arg(long, value_name = "ID")]
+        waiting_on: Option<String>,
+        /// Only waiting tasks whose dependency failed or was canceled.
+        #[arg(long)]
+        stuck: bool,
     },
     Show {
         id: String,
@@ -286,7 +292,13 @@ enum TaskCmd {
     },
     Create {
         channel: String,
-        text: String,
+        /// The task text. Not used with --file.
+        #[arg(required_unless_present = "file")]
+        text: Option<String>,
+        /// Create every task in a plan file in one commit (HANDOFF 6.8.8).
+        /// Tasks name each other by key in `after`.
+        #[arg(long, value_name = "PLAN.json", conflicts_with_all = ["text", "after", "replaces"])]
+        file: Option<PathBuf>,
         #[command(flatten)]
         m: MsgArgs,
         #[arg(long, value_parser = parse_duration)]
@@ -929,6 +941,8 @@ async fn tasks(
             selector,
             state,
             labels,
+            waiting_on,
+            stuck,
         } => {
             let mut p = vec![];
             if let Some(s) = selector {
@@ -937,6 +951,12 @@ async fn tasks(
             if let Some(s) = state {
                 p.push(("state", s));
             }
+            if let Some(id) = waiting_on {
+                p.push(("waiting_on", id));
+            }
+            if stuck {
+                p.push(("stuck", "true".to_string()));
+            }
             p.extend(labels.into_iter().map(|l| ("label", l)));
             let v = client.get(&format!("/tasks{}", query(&p))).await?;
             if json {
@@ -944,13 +964,19 @@ async fn tasks(
             } else {
                 let page: TasksPage = serde_json::from_value(v).map_err(internal)?;
                 for t in page.tasks {
-                    let t = t.task;
                     let holder = t
+                        .task
                         .claim
                         .as_ref()
                         .map(|c| format!(" by {}", c.holder))
                         .unwrap_or_default();
-                    println!("{}\t{}\t{}{holder}", t.id, t.state.as_str(), t.channel);
+                    let state = if t.stuck {
+                        "waiting (stuck)".to_string()
+                    } else {
+                        t.task.state.as_str().to_string()
+                    };
+                    let t = t.task;
+                    println!("{}\t{state}\t{}{holder}", t.id, t.channel);
                 }
             }
         }
@@ -991,6 +1017,7 @@ async fn tasks(
         TaskCmd::Create {
             channel,
             text,
+            file,
             m,
             lease,
             max_attempts,
@@ -1000,6 +1027,18 @@ async fn tasks(
             after,
             replaces,
         } => {
+            if let Some(file) = file {
+                return create_plan(
+                    &client,
+                    &home,
+                    &channel,
+                    &file,
+                    models.as_deref(),
+                    key,
+                    json,
+                )
+                .await;
+            }
             let mut labels = parse_labels(&m.labels)?;
             if !needs.is_empty() {
                 let l = workers::load(&home, models.as_deref(), None)?;
@@ -1007,7 +1046,7 @@ async fn tasks(
             }
             let req = CreateTaskReq {
                 channel,
-                text,
+                text: text.unwrap_or_default(),
                 labels,
                 data: parse_data(&m.data)?,
                 lease_ms: ms(lease),
@@ -1348,6 +1387,52 @@ fn print_message(m: &MessageOut, in_thread: bool) {
     }
 }
 
+/// `cork tasks create <channel> --file plan.json`: one commit for the whole
+/// plan. The file's `idempotency_key` is sent as the key, so resending the
+/// same plan is a no-op.
+async fn create_plan(
+    client: &Client,
+    home: &Path,
+    channel: &str,
+    file: &Path,
+    models: Option<&Path>,
+    key: Option<&str>,
+    json: bool,
+) -> Result<i32, ClientError> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| usage(format!("cannot read {}: {e}", file.display())))?;
+    let mut plan: PlanReq = serde_json::from_str(&text)
+        .map_err(|e| usage(format!("{} is not a plan: {e}", file.display())))?;
+    plan.channel.get_or_insert_with(|| channel.to_string());
+    if plan.tasks.iter().any(|t| !t.needs.is_empty()) {
+        let l = workers::load(home, models, None)?;
+        for t in &mut plan.tasks {
+            let needs = std::mem::take(&mut t.needs);
+            if !needs.is_empty() {
+                t.labels.extend(workers::needs_labels(&l.catalog, &needs)?);
+            }
+        }
+    }
+    let key = key
+        .map(str::to_string)
+        .or_else(|| plan.idempotency_key.clone());
+    let v = client.create_plan(&plan, key.as_deref()).await?;
+    if json {
+        print_json(&v);
+    } else {
+        let out: PlanOut = serde_json::from_value(v).map_err(internal)?;
+        for t in out.tasks {
+            println!(
+                "{}\t{}\t{}",
+                t.key,
+                t.task.task.id,
+                t.task.task.state.as_str()
+            );
+        }
+    }
+    Ok(0)
+}
+
 fn print_task(t: &TaskOut) {
     let k = &t.task;
     println!(
@@ -1368,6 +1453,35 @@ fn print_task(t: &TaskOut) {
             c.holder,
             c.expires_at - t.now
         );
+    }
+    if !t.dependencies.is_empty() {
+        let deps: Vec<String> = t
+            .dependencies
+            .iter()
+            .map(|d| {
+                if d.head == d.task_id {
+                    format!("{} ({})", d.task_id, d.state.as_str())
+                } else {
+                    format!("{} → {} ({})", d.task_id, d.head, d.state.as_str())
+                }
+            })
+            .collect();
+        let stuck = if t.stuck { "  [stuck]" } else { "" };
+        println!("  Waiting on: {}{stuck}", deps.join(", "));
+    }
+    if !t.dependents.is_empty() {
+        let d: Vec<String> = t
+            .dependents
+            .iter()
+            .map(|d| format!("{} ({})", d.task_id, d.state.as_str()))
+            .collect();
+        println!("  Needed by: {}", d.join(", "));
+    }
+    if let Some(r) = &k.replaces {
+        println!("  Replaces: {r}");
+    }
+    if let Some(r) = &k.replaced_by {
+        println!("  Replaced by: {r}");
     }
     for (label, v) in [
         ("result", &k.result),

@@ -2,7 +2,7 @@
 //! and every client. Changes are additive only: new routes, new optional
 //! fields. Clients ignore fields and event types they do not know.
 
-use cork_core::{Labels, Message, Millis, Task, TaskState};
+use cork_core::{Actor, Labels, Message, Millis, Task, TaskState};
 use serde::{Deserialize, Serialize};
 
 /// Bumped only for a breaking change, which also means a new `/vN` prefix.
@@ -176,13 +176,120 @@ pub struct CreateTaskReq {
     pub replaces: Option<String>,
 }
 
+/// `POST /tasks/plan`: tasks and how they relate, created in one commit
+/// (HANDOFF 6.8.8). Send the plan's idempotency key as the header.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanReq {
+    /// The channel for tasks that name none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Kept in the file for the client, which sends it as `Idempotency-Key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    pub tasks: Vec<PlanTask>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanTask {
+    /// Unique in the plan; other tasks name it in `after`.
+    pub key: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub labels: Labels,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// Keys in this plan, or ids of existing tasks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// Model keywords, turned into `needs.<k>` labels by the client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    #[serde(default, rename = "for", skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+}
+
+/// The most tasks in one plan.
+pub const PLAN_MAX_TASKS: usize = 1_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanOut {
+    /// In the order of the plan file.
+    pub tasks: Vec<PlannedTask>,
+    pub now: Millis,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedTask {
+    pub key: String,
+    #[serde(flatten)]
+    pub task: TaskOut,
+}
+
 /// One task. `task.state` is the effective state at `now`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskOut {
     pub task: Task,
     pub root: MessageOut,
     pub now: Millis,
+    /// Each declared dependency with its head now (HANDOFF 6.8.7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<DependencyOut>,
+    /// Tasks with a dependency that resolves to this one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependents: Vec<DependentOut>,
+    /// Waiting while the head of a dependency is failed or canceled (Decision 1).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stuck: bool,
 }
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// A declared dependency and the task it resolves to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DependencyOut {
+    /// The id the task declared.
+    pub task_id: String,
+    /// The newest task in its replacement chain.
+    pub head: String,
+    /// The head's effective state.
+    pub state: TaskState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Millis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DependentOut {
+    pub task_id: String,
+    pub state: TaskState,
+}
+
+/// What a completed dependency passes on to the task that claimed after it
+/// (Decision 2). Written by other agents: notes, not instructions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DependencyResult {
+    /// The id the task declared.
+    pub task_id: String,
+    pub head: String,
+    /// The first 2 KB of the head's root message.
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Millis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<Actor>,
+}
+
+/// The longest `text` in a [`DependencyResult`].
+pub const DEPENDENCY_TEXT_MAX: usize = 2 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TasksPage {
@@ -197,6 +304,9 @@ pub struct TaskListItem {
     pub created_position: u64,
     #[serde(flatten)]
     pub task: Task,
+    /// See [`TaskOut::stuck`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stuck: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -245,6 +355,9 @@ pub struct ClaimOut {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<Message>,
     pub now: Millis,
+    /// The results of the task's dependencies, in declared order (Decision 2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<DependencyResult>,
 }
 
 impl ClaimOut {
@@ -258,6 +371,7 @@ impl ClaimOut {
             task: None,
             root: None,
             now,
+            dependencies: vec![],
         }
     }
 }

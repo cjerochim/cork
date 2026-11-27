@@ -46,6 +46,7 @@ async fn main() {
             Scenario::Waiters,
             Scenario::Soak,
             Scenario::Lead,
+            Scenario::Deps,
         ],
     };
     let mut ok = true;
