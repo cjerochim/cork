@@ -266,14 +266,23 @@ fn a_worker_that_kills_itself_uses_up_the_attempts() {
     e.wait_state(&task, "failed", Duration::from_secs(5));
     let t = e.json(&["tasks", "show", &task])["task"].clone();
     assert_eq!(t["attempts"], 2);
-    let hist = e.json(&["tasks", "history", &task]);
-    let types: Vec<&str> = hist["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["type"].as_str().unwrap())
-        .collect();
-    assert_eq!(types[types.len() - 2..], ["LeaseExpired", "TaskFailed"]);
+    // The read above already sees the lapsed lease as failed; the lease
+    // timer writes LeaseExpired and TaskFailed a moment later.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let hist = e.json(&["tasks", "history", &task]);
+        let types: Vec<String> = hist["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["type"].as_str().unwrap().to_string())
+            .collect();
+        if types[types.len() - 2..] == ["LeaseExpired", "TaskFailed"] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "history ends {types:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
