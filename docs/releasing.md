@@ -195,7 +195,7 @@ No Rust code changes. crates.io and npm are turned on later, each by a one-line 
 
 ## 9. Decisions
 
-1. ~~**First release.**~~ **Decided 2026-11-27:** semver, and one `0.1.0` from `main` covering Milestones 1–3, no retro tags.
+1. **First release.** Semver, and one `0.1.0` from `main` covering Milestones 1–3, no retro tags. Decided by Chris on 2026-11-27.
 2. **Changelog.** Generated from commit prefixes, editable in the release PR.
 3. **Order of packages.** GitHub releases first, then crates.io, then npm. No Homebrew for now.
 4. **npm name.** `cork-cli`, the same as the crate.
