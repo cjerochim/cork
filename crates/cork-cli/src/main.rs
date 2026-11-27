@@ -54,6 +54,10 @@ enum Cmd {
         /// Load an export into an empty database before serving.
         #[arg(long)]
         import: Option<PathBuf>,
+        /// Leave channel names out of `/metrics`, for boards whose channel
+        /// names are private.
+        #[arg(long)]
+        no_metrics_channels: bool,
     },
     /// Show who the daemon thinks you are.
     Whoami,
@@ -203,6 +207,11 @@ enum WorkersCmd {
     },
     /// Pools, sizes, busy and idle workers, restarts and unmatched tasks.
     Status {
+        #[command(flatten)]
+        pick: FleetPick,
+    },
+    /// The supervisor's metrics, in Prometheus text format.
+    Metrics {
         #[command(flatten)]
         pick: FleetPick,
     },
@@ -496,6 +505,7 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
             db,
             sync,
             import,
+            no_metrics_channels,
         } => {
             serve::serve(serve::ServeOpts {
                 home: home.clone(),
@@ -503,6 +513,7 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
                 db: db.clone().unwrap_or_else(|| home.join("cork.db")),
                 full_sync: sync == "full",
                 import: import.clone(),
+                metrics_channels: !*no_metrics_channels,
             })
             .await
             .map_err(|e| ClientError::new("internal", e))?;
@@ -539,6 +550,7 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
         Cmd::Workers {
             cmd:
                 c @ (WorkersCmd::Status { .. }
+                | WorkersCmd::Metrics { .. }
                 | WorkersCmd::Scale { .. }
                 | WorkersCmd::Drain { .. }
                 | WorkersCmd::Reload { .. }
@@ -546,6 +558,7 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
         } => {
             let (pick, req) = match c {
                 WorkersCmd::Status { pick } => (pick, serde_json::json!({"op": "status"})),
+                WorkersCmd::Metrics { pick } => (pick, serde_json::json!({"op": "metrics"})),
                 WorkersCmd::Scale { pool, count, pick } => (
                     pick,
                     serde_json::json!({"op": "scale", "pool": pool, "count": count}),
@@ -645,6 +658,7 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
                 | WorkersCmd::Match { task_id: None, .. }
                 | WorkersCmd::Up { .. }
                 | WorkersCmd::Status { .. }
+                | WorkersCmd::Metrics { .. }
                 | WorkersCmd::Scale { .. }
                 | WorkersCmd::Drain { .. }
                 | WorkersCmd::Reload { .. }

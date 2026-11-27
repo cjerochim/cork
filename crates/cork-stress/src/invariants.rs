@@ -6,6 +6,8 @@
 //! - No `TaskCompleted` or `TaskFailed` from a claim that was not live at its
 //!   `at` time, and no `LeaseExpired` before the lease really ended.
 //! - Projections equal a fresh fold of the log.
+//! - `/metrics` agrees with the log: event counters since the daemon
+//!   started, and tasks by channel and state (HANDOFF 18.7, item 5).
 
 use crate::daemon::Daemon;
 use cork_core::{Task, TaskEvent};
@@ -71,6 +73,7 @@ pub async fn check(d: &Daemon) -> Check {
             check_projection(&mut c, d, id, evs).await;
         }
     }
+    check_metrics(&mut c, d, &events).await;
     let channels = d.board.store().list_channels().await.expect("channels");
     let projected: u64 = channels.iter().map(|ch| ch.messages).sum();
     if projected != posted {
@@ -217,4 +220,87 @@ async fn refold(d: &Daemon, id: &str) -> Option<Task> {
         ));
     }
     Task::from_events(evs.iter().map(|(e, at)| (e, *at))).ok()
+}
+
+/// `/metrics` against the log. The lease timer may write while we look, so
+/// a mismatch is read again a few times before it counts.
+async fn check_metrics(c: &mut Check, d: &Daemon, first: &[Value]) {
+    let mut events: Vec<Value> = first.to_vec();
+    let mut last = String::new();
+    for round in 0..5 {
+        if round > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        let Some(m) = d.metrics().await else {
+            last = "could not scrape /metrics".into();
+            continue;
+        };
+        let head = m.get("cork_log_head").copied().unwrap_or(0.0) as u64;
+        if head > events.len() as u64 {
+            match d.client("checker").all_events().await {
+                Ok(e) => events = e,
+                Err(_) => continue,
+            }
+        }
+        let start = d.board.started_head();
+        let mut want: BTreeMap<String, f64> = BTreeMap::new();
+        for e in &events {
+            let pos = e["position"].as_u64().unwrap_or(0);
+            if pos > start && pos <= head {
+                *want
+                    .entry(format!(
+                        "cork_events_total{{type=\"{}\"}}",
+                        e["type"].as_str().unwrap_or("")
+                    ))
+                    .or_default() += 1.0;
+            }
+        }
+        let mut tasks: BTreeMap<String, f64> = BTreeMap::new();
+        let mut after = 0;
+        loop {
+            let page = d
+                .board
+                .store()
+                .list_tasks(&cork_store::TaskQuery {
+                    after,
+                    limit: 1_000,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_default();
+            let n = page.len();
+            for t in page {
+                after = after.max(t.created_position);
+                *tasks
+                    .entry(format!(
+                        "cork_tasks{{channel=\"{}\",state=\"{}\"}}",
+                        t.task.channel,
+                        t.task.state.as_str()
+                    ))
+                    .or_default() += 1.0;
+            }
+            if n < 1_000 {
+                break;
+            }
+        }
+        want.extend(tasks);
+        let got: BTreeMap<String, f64> = m
+            .into_iter()
+            .filter(|(k, _)| k.starts_with("cork_events_total{") || k.starts_with("cork_tasks{"))
+            .collect();
+        if got == want {
+            return;
+        }
+        let diff: Vec<String> = want
+            .keys()
+            .chain(got.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|k| want.get(*k) != got.get(*k))
+            .take(5)
+            .map(|k| format!("{k}: log {:?}, /metrics {:?}", want.get(k), got.get(k)))
+            .collect();
+        last = diff.join("; ");
+    }
+    c.bad(format!("/metrics disagrees with the log: {last}"));
 }

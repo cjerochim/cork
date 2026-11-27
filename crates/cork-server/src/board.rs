@@ -47,6 +47,12 @@ pub struct BoardConfig {
     pub name: String,
     pub max_wait_ms: u64,
     pub max_streams: usize,
+    /// Label `/metrics` task gauges with channel names. Server mode can turn
+    /// this off for boards whose channel names are private (18.6).
+    pub metrics_channels: bool,
+    /// The WAL file, for `cork_wal_bytes`. The server knows no SQLite, so
+    /// the binary that opened the store names it.
+    pub wal_path: Option<std::path::PathBuf>,
 }
 
 impl Default for BoardConfig {
@@ -56,6 +62,8 @@ impl Default for BoardConfig {
             name: "cork".into(),
             max_wait_ms: DEFAULT_MAX_WAIT_MS,
             max_streams: 1_000,
+            metrics_channels: true,
+            wal_path: None,
         }
     }
 }
@@ -174,6 +182,8 @@ pub struct Batch {
     /// Tasks this batch moved into `ready`, in order.
     ready: Vec<Task>,
     handoffs: Vec<Handoff>,
+    /// Tasks that changed state, for `/metrics`.
+    moves: Vec<crate::metrics::Move>,
 }
 
 impl Batch {
@@ -185,6 +195,7 @@ impl Batch {
             posted: HashMap::new(),
             ready: vec![],
             handoffs: vec![],
+            moves: vec![],
         }
     }
 
@@ -271,6 +282,11 @@ impl Batch {
             key: TASK_LABEL.into(),
             value: after.state.as_str().into(),
         });
+        let before_state = before.map(|b| b.state);
+        if before_state != Some(after.state) {
+            self.moves
+                .push((after.channel.clone(), before_state, after.state));
+        }
         let was_ready = before.is_some_and(|b| b.state == TaskState::Ready);
         if after.state == TaskState::Ready && !was_ready {
             self.ready.push(after.clone());
@@ -415,6 +431,10 @@ pub struct Board<S: Store> {
     recent: Mutex<VecDeque<Arc<StoredEvent>>>,
     last_write: Mutex<std::time::Instant>,
     store_reads: AtomicU64,
+    metrics: Arc<crate::metrics::Metrics>,
+    /// The head when this board started: `/metrics` counters count the
+    /// events after it.
+    started_head: AtomicU64,
 }
 
 impl<S: Store> Board<S> {
@@ -441,10 +461,16 @@ impl<S: Store> Board<S> {
             recent: Mutex::new(VecDeque::new()),
             last_write: Mutex::new(std::time::Instant::now()),
             store_reads: AtomicU64::new(0),
+            metrics: Arc::default(),
+            started_head: AtomicU64::new(0),
         });
         board
             .head
             .store(board.store.head().await?, Ordering::SeqCst);
+        board
+            .started_head
+            .store(board.head.load(Ordering::SeqCst), Ordering::SeqCst);
+        board.seed_metrics().await?;
         board.restart_grace().await?;
         tokio::spawn(board.clone().lease_timer());
         tokio::spawn(board.clone().maintenance());
@@ -483,17 +509,23 @@ impl<S: Store> Board<S> {
         let _order = self.write_lock.lock().await;
         let clock = self.clock.clone();
         let waiters = self.waiters.clone();
+        let started = std::time::Instant::now();
         let r = self
             .store
             .write(move |tx| {
                 let mut b = Batch::new(tx.head()?, clock.now());
                 let value = f(tx, &mut b)?;
                 b.hand_out(tx, &waiters)?;
-                Ok((b.commit, (value, b.handoffs)))
+                Ok((b.commit, (value, b.handoffs, b.moves)))
             })
             .await;
         match r {
-            Ok((events, (value, handoffs))) => {
+            Ok((events, (value, handoffs, moves))) => {
+                self.metrics.committed(
+                    events.iter().map(|e| e.event_type.as_str()),
+                    &moves,
+                    started.elapsed().as_secs_f64(),
+                );
                 self.degraded.store(false, Ordering::Relaxed);
                 let touches_tasks = events.iter().any(|e| e.stream_id.starts_with("task:"));
                 if !events.is_empty() {
@@ -546,8 +578,10 @@ impl<S: Store> Board<S> {
         F: FnOnce(&mut dyn WriteTx, &mut Batch) -> Result<R> + Send + 'static,
     {
         let person = caller.actor.person.clone();
+        let metrics = self.metrics.clone();
         self.write(move |tx, b| {
             if let Some(v) = idem_check(tx, &person, idem.as_ref())? {
+                metrics.idempotency_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(v);
             }
             let v = serde_json::to_value(f(tx, b)?).map_err(json_err)?;
@@ -833,6 +867,55 @@ impl<S: Store> Board<S> {
             Ok((n, ids.len() == EXPIRE_BATCH))
         })
         .await
+    }
+
+    /// Count stored tasks by channel and state, once, at start.
+    async fn seed_metrics(&self) -> Result<()> {
+        let mut after = 0;
+        loop {
+            let page = self
+                .store
+                .list_tasks(&TaskQuery {
+                    after,
+                    limit: EVENTS_PAGE_MAX,
+                    now: self.now(),
+                    ..Default::default()
+                })
+                .await?;
+            let n = page.len();
+            for t in page {
+                after = after.max(t.created_position);
+                self.metrics.seed(&t.task.channel, t.task.state);
+            }
+            if n < EVENTS_PAGE_MAX {
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn metrics(&self) -> &crate::metrics::Metrics {
+        &self.metrics
+    }
+
+    /// The head when this board started; `/metrics` counts events after it.
+    pub fn started_head(&self) -> u64 {
+        self.started_head.load(Ordering::SeqCst)
+    }
+
+    /// `GET /metrics`: Prometheus text.
+    pub fn metrics_text(&self) -> String {
+        let live = crate::metrics::Live {
+            head: self.head.load(Ordering::SeqCst),
+            waiters: self.waiters.lock().unwrap().queue.len(),
+            streams: self.streams.load(Ordering::SeqCst),
+            wal_bytes: self
+                .cfg
+                .wal_path
+                .as_ref()
+                .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)),
+            degraded: self.is_degraded(),
+        };
+        self.metrics.render(&live, self.cfg.metrics_channels)
     }
 
     async fn restart_grace(&self) -> Result<()> {

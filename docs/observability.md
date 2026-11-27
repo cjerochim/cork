@@ -129,3 +129,70 @@ The per-group **cost** column is different: it counts each attempt where it ran.
 `--json` prints the whole report, including every percentile, the cost sources and the queue depth. `--csv` prints one row per group and an `all` row, in milliseconds and dollars. `--reasons` adds failure reasons grouped by their first line. Without it, `cork stats` prints no message text.
 
 The queue line reports the most tasks ready at once, the time-weighted mean, and how many are ready at the end of the log. It covers every task the events include, before the label and feature filters.
+
+## Live metrics
+
+### The daemon: `GET /metrics`
+
+The daemon serves Prometheus text at `/metrics` (next to `/v1`, not under it), behind the same Host check and token as the API:
+
+```bash
+curl -s -H "Authorization: Bearer $(jq -r .token ~/.config/cork/daemon.json)" \
+  http://127.0.0.1:7420/metrics
+```
+
+It holds only what the daemon knows. No model or cost data: the daemon knows nothing of models.
+
+| Metric | What it is |
+| --- | --- |
+| `cork_tasks{channel,state}` | Tasks by stored state. Counted from the store at start, then kept up to date from each commit. |
+| `cork_events_total{type}` | Events committed since the daemon started, by type. |
+| `cork_claims_total`, `cork_settles_total{op}`, `cork_lease_expiries_total` | The same counts by name: claims, settles (`complete`, `fail`, `release`, `block`) and lease expiries. |
+| `cork_commits_total` | Commits that wrote events. |
+| `cork_idempotency_hits_total` | Writes answered from a stored idempotency key. |
+| `cork_write_seconds` | Histogram: time in the store's write transaction, per write. |
+| `cork_commit_events` | Histogram: events per commit. |
+| `cork_log_head` | The last committed position. |
+| `cork_waiters`, `cork_streams` | Claims waiting for a task, and open event streams. |
+| `cork_degraded` | 1 while the store refuses writes. |
+| `cork_wal_bytes` | The size of the SQLite write-ahead log. |
+
+Counters start at zero when the daemon starts, as Prometheus expects. `cork_tasks` is the stored state: a lease that has run out shows as claimed until the lease timer records it, which takes moments.
+
+Everything is updated after a commit with atomics or a short lock, and a scrape never reads the store, so scraping does not slow writes.
+
+`cork serve --no-metrics-channels` leaves channel names out: `cork_tasks` is then summed per state. Use it on boards whose channel names are private.
+
+`cork-stress` checks `/metrics` against the log after every scenario: every `cork_events_total` counter against the events since the daemon started, and every `cork_tasks` gauge against the stored tasks.
+
+### The fleet supervisor
+
+`cork workers metrics` prints the supervisor's metrics over its control socket. To let Prometheus scrape it, set a loopback port in `workers.toml`:
+
+```toml
+[fleet]
+name = "laptop"
+models = "models.toml"
+metrics_port = 9464   # serves http://127.0.0.1:9464/metrics
+```
+
+| Metric | What it is |
+| --- | --- |
+| `cork_fleet_workers{pool,model,state}` | Workers `busy`, `idle` and `draining`. |
+| `cork_fleet_pool_target{pool}` | Workers each pool aims for. |
+| `cork_fleet_pool_paused{pool}` | 1 while a pool is paused after a crash loop. |
+| `cork_fleet_restarts_total{pool}`, `cork_fleet_crash_loops_total{pool}` | Crashes, and pauses for crash loops. |
+| `cork_fleet_unmatched_tasks` | Ready tasks with needs no pool covers. |
+| `cork_fleet_usage_attempts_total{pool,model}` | Attempts whose wrapper reported usage. |
+| `cork_fleet_input_tokens_total`, `cork_fleet_output_tokens_total`, `cork_fleet_cost_usd_total`, `cork_fleet_cost_unknown_total` | Usage per pool and model, from the same records the wrappers post to the board. Cost is what the agents reported. |
+
+The supervisor sets `$CORK_USAGE_REPORT` for each worker, and the wrapper leaves its usage record there as well as posting it. Like the daemon's, these counters start at zero when the supervisor starts; `cork stats` is the record that lasts.
+
+### Dashboards
+
+[`docs/grafana-dashboard.json`](grafana-dashboard.json) is an example Grafana dashboard for both: tasks by state, claims and settles, lease expiries, write latency, waiters, WAL size, and the fleet's workers, cost and tokens by model. Cork ships no alerting of its own.
+
+## Not built
+
+- **OpenTelemetry tracing** (HANDOFF 18.5) is marked "later and optional" in the spec, so it is not part of Milestone 3.
+- **The real report** (18.7 item 7) needs the real lead runs of 17.5, which use paid agents and are still to do. Once they run, `cork stats --feature <id>` on that board gives the numbers for the write-up.

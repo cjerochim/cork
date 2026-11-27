@@ -1276,7 +1276,7 @@ Use 5 to 10 small features from a real repo, each with a written definition of d
 
 ## 18. Observability: performance, cost and usage (Milestone 3, planned)
 
-**Status:** plan only, added on 2026-11-27 at Chris's request. Do not build it until Chris says go. It comes after the fleet (16) and the lead (17), because it measures them.
+**Status:** added on 2026-11-27 at Chris's request, and built in Milestone 3 (usage capture, `cork stats`, the daemon's and the supervisor's `/metrics`). Tracing (18.5) is left for later, and the real report (18.7 item 7) waits on the real lead runs of 17.5. The user guide is [docs/observability.md](docs/observability.md).
 
 **The headline number is cost per successful task, by model.** Failed attempts, lease expiries and escalations all count toward it. A cheap model that fails half the time and needs a retry on a strong one can cost more than starting on the strong one. This number shows that.
 

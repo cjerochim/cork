@@ -40,10 +40,15 @@ impl Daemon {
         };
         let store = Arc::new(SqliteStore::open(cfg).await.expect("open store"));
         let floor = cork_store::Store::max_at(&*store).await.expect("max_at");
+        let mut wal = path.clone().into_os_string();
+        wal.push("-wal");
         let board = Board::start(
             store,
             Arc::new(SystemClock::anchored(floor)),
-            BoardConfig::default(),
+            BoardConfig {
+                wal_path: Some(wal.into()),
+                ..Default::default()
+            },
         )
         .await
         .expect("start board");
@@ -92,6 +97,30 @@ impl Daemon {
         drop(self);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         Self::open(dir, path, sync).await
+    }
+
+    /// Scrape `GET /metrics` with the token, as `name{labels}` to value.
+    pub async fn metrics(&self) -> Option<std::collections::BTreeMap<String, f64>> {
+        let base = self.url.trim_end_matches("/v1");
+        let text = self
+            .http
+            .get(format!("{base}/metrics"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .ok()?
+            .text()
+            .await
+            .ok()?;
+        Some(
+            text.lines()
+                .filter(|l| !l.starts_with('#') && !l.is_empty())
+                .filter_map(|l| {
+                    let (k, v) = l.rsplit_once(' ')?;
+                    Some((k.to_string(), v.parse().ok()?))
+                })
+                .collect(),
+        )
     }
 
     pub fn wal_bytes(&self) -> u64 {
