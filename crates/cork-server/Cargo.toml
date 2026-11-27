@@ -1,0 +1,29 @@
+[package]
+name = "cork-server"
+description = "The Cork daemon: HTTP API, single writer, lease timer, waits and the event stream."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream = "0.3"
+axum = "0.8"
+axum-extra = { version = "0.12", features = ["query"] }
+cork-api = { path = "../cork-api", version = "0.1.0" }
+cork-core = { path = "../cork-core", version = "0.1.0" }
+cork-store = { path = "../cork-store", version = "0.1.0" }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+hex = "0.4"
+subtle = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+ulid = "1"
+
+[dev-dependencies]
+cork-store-sqlite = { path = "../cork-store-sqlite" }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+tempfile = "3"
