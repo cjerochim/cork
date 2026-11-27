@@ -249,6 +249,23 @@ fn wait_returns_on_a_matching_post_and_times_out_otherwise() {
     let out = w.wait_with_output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["data"]["text"], "labelled");
+
+    // A lead waits for a task to finish.
+    let t = e.ok(&["tasks", "create", "work/plan", "do"]);
+    let mut w = e.spawn(&[
+        "--json",
+        "wait",
+        "work/",
+        "--label",
+        "board.task=completed",
+        "--timeout",
+        "10s",
+    ]);
+    std::thread::sleep(Duration::from_millis(500));
+    e.ok(&["--as", "w", "tasks", "run", &t, "--", "true"]);
+    assert_eq!(wait_exit(&mut w, Duration::from_secs(10)), 0);
+    let v: Value = serde_json::from_slice(&w.wait_with_output().unwrap().stdout).unwrap();
+    assert_eq!(v["type"], "TaskCompleted");
 }
 
 #[test]
