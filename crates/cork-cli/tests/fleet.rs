@@ -900,3 +900,84 @@ fn the_supervisor_serves_metrics_with_the_usage_its_workers_report() {
     assert_eq!(u[0]["data"]["pool"], "cheap");
     drop(f);
 }
+
+/// HANDOFF 19.10 item 5: pattern pools route, the lead keeps features to
+/// itself, `status` and `reload` report overlaps, `match` names the pattern.
+#[test]
+fn pattern_pools_route_report_overlaps_and_explain() {
+    let e = Env::new();
+    let pools = "[pool.tests]\nmodel = \"haiku\"\nselect = \"work/*/tests\"\n\
+                 [pool.general]\nmodel = \"sonnet\"\nselect = [\"**\", \"!features/\"]\n\
+                 [pool.lead]\nmodel = \"opus\"\nselect = \"features/\"\n";
+    let f = Fleet::up(&e, "pat", pools);
+    let t = create(&e, "work/api/tests", "test it", &[]);
+    let g = create(&e, "work/app", "build it", &[]);
+    let l = create(&e, "features/login", "plan it", &[]);
+    for (id, who) in [(&t, "haiku"), (&g, "sonnet"), (&l, "opus")] {
+        e.wait_state(id, "completed", Duration::from_secs(15));
+        let r = e.json(&["tasks", "show", id])["task"]["result"].clone();
+        assert_eq!(r.as_str().unwrap().trim(), format!("{who} did it"));
+    }
+
+    let s = f.status(&e);
+    let o: Vec<&str> = s["overlaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        o,
+        ["general and tests overlap on work/api/tests; tests wins (cheaper)"]
+    );
+    let text = e.ok(&["workers", "status", "--fleet", "pat"]);
+    assert!(text.contains("tests wins (cheaper)"), "{text}");
+    assert!(text.contains("on **,!features/"), "{text}");
+    let msg = f.ctl(&e, &["reload"]);
+    assert!(msg.contains("general and tests overlap"), "{msg}");
+
+    let cfg = format!("--config={}", f.config.display());
+    let out = e.ok(&["workers", "match", &t, &cfg]);
+    assert!(
+        out.contains("task in work/api/tests, needs nothing"),
+        "{out}"
+    );
+    assert!(
+        out.contains("pool tests (haiku): covers (select work/*/tests matched)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("pool general (sonnet): covers (select ** matched)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("pool lead (opus): does not select work/api/tests (features/ only)"),
+        "{out}"
+    );
+    let out = e.ok(&[
+        "workers",
+        "match",
+        "--channel",
+        "features/x",
+        "--needs",
+        "rust",
+        &cfg,
+    ]);
+    assert!(
+        out.contains("pool general (sonnet): does not select features/x (excluded by !features/)"),
+        "{out}"
+    );
+    assert!(out.contains("gives it to pool lead (opus)"), "{out}");
+
+    // A non-lead pool that could take features is refused.
+    let bad = e.home().join("bad.toml");
+    std::fs::write(
+        &bad,
+        "[fleet]\nname = \"bad\"\nmodels = \"models.toml\"\n[pool.any]\nmodel = \"haiku\"\nselect = \"**\"\n",
+    )
+    .unwrap();
+    let o = e.run(&["workers", "up", "--config", bad.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("only the lead pool takes"), "{err}");
+}

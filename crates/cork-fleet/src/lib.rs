@@ -12,4 +12,4 @@ pub mod supervisor;
 
 pub use catalog::{Catalog, Model, Needs, Price, UnknownKeyword};
 pub use config::{Fleet, Pool};
-pub use routing::{TaskFacts, Verdict};
+pub use routing::{Overlap, TaskFacts, Verdict};

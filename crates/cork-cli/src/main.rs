@@ -256,6 +256,9 @@ enum WorkersCmd {
         /// Ask about a task before it exists.
         #[arg(long, value_delimiter = ',', conflicts_with = "task_id")]
         needs: Vec<String>,
+        /// The channel of a task that doesn't exist yet: which pools select it.
+        #[arg(long, conflicts_with = "task_id")]
+        channel: Option<String>,
         #[command(flatten)]
         files: FleetFiles,
     },
@@ -620,11 +623,12 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
                 WorkersCmd::Match {
                     task_id: None,
                     needs,
+                    channel,
                     files,
                 },
         } => {
             let l = workers::load(&home, files.models.as_deref(), files.config.as_deref())?;
-            return workers::matches(&l, None, None, needs, cli.json).await;
+            return workers::matches(&l, None, None, needs, channel.as_deref(), cli.json).await;
         }
         _ => {}
     }
@@ -700,7 +704,7 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
                 },
         } => {
             let l = workers::load(&home, files.models.as_deref(), files.config.as_deref())?;
-            return workers::matches(&l, Some(&client), Some(&id), &[], json).await;
+            return workers::matches(&l, Some(&client), Some(&id), &[], None, json).await;
         }
         Cmd::Whoami => {
             let w = client.whoami().await?;
