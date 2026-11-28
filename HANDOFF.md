@@ -12,7 +12,7 @@ Read this file first. Then start at "Milestone 1".
 
 **Added 2026-11-28, planned, not built:** wildcard channel patterns, and several patterns in one selector (19). Signed off by Chris on 2026-11-28.
 
-**Added 2026-11-28, spec only, not built:** the office view, a live read-only web UI at `/ui/` with day and night themes (20). Direction picked by Chris; open questions in 20.11.
+**Added 2026-11-28, spec only, not built:** the board view, a live read-only web UI at `/ui/`: a column board with light and dark themes (20). Direction picked by Chris; open questions in 20.11.
 
 **Added 2026-11-27, planned, not built:** task dependencies and the `waiting` state, in the core (6.8). Signed off by Chris on 2026-11-27, including both decisions in 6.8.10.
 
@@ -1525,82 +1525,89 @@ With `--channel <name>` it answers the same question for a task that doesn't exi
 5. `workers up` refuses a non-lead pool that can match `features/`. `status` reports overlaps. `match` names the matching pattern.
 6. Every selector from Milestones 1 to 3 behaves exactly as before.
 
-## 20. The office view (a live web UI)
+## 20. The board view (a live web UI)
 
-**Status:** direction picked by Chris on 2026-11-28: the daylight studio (A) and night shift (B) designs, as one view with two themes. Spec only. Not built. The open questions are in 20.11.
+**Status:** direction picked by Chris on 2026-11-28: a plain column board in the style of Linear, with a light theme (J) and a dark theme (K). This replaces the earlier 3D office direction. Spec only. Not built. The open questions are in 20.11.
 
-The design canvas: [Cork office directions](https://claude.ai/artifact/4ykkuP4WUcwo3mCjtsjuKh) (artboards A and B).
+The design canvas: [Cork directions](https://claude.ai/artifact/4ykkuP4WUcwo3mCjtsjuKh) (artboards J and K).
 
-| Day (A) | Night (B) |
+| Light (J) | Dark (K) |
 | --- | --- |
-| ![The office by day](docs/images/office-day.webp) | ![The office at night](docs/images/office-night.webp) |
+| ![The board, light](docs/images/board-light.webp) | ![The board, dark](docs/images/board-dark.webp) |
 
-This section adds a read-only, full-screen picture of the board. It shows a small office seen from above at an angle. Each task state is a room, workers are people at desks, and task cards move between rooms as events arrive. It fills the first part of section 14. It reads only through the public API, it writes nothing, and it comes before server mode (13).
+This section adds a read-only web page that shows one board as columns of task cards, updated live as events arrive. It fills the first part of section 14. It reads only through the public API, writes nothing, and comes before server mode (13). It is plain HTML, CSS and JavaScript: no 3D, no framework, no build step.
 
 ### 20.1 What you see
 
-The whole browser window is the office. There is no page around it. Everything else floats on top as panels (20.4).
+A sidebar on the left, a top bar, the columns, and a one-line event strip along the bottom.
 
-Each room holds one task state. The room is chosen by the state alone:
+**Columns.** One column for each open state, in the order work flows:
 
-| State | Room | What is in it |
+| Column | State | Order |
 | --- | --- | --- |
-| `waiting` | Waiting room | Sofas. Each card sits on the coffee table until its dependencies are met. |
-| `ready` | Reception | Cards lined up on the counter, oldest first, the way claims take them (FIFO). |
-| `claimed` | Workroom | A desk for each worker, grouped by pool. The card sits on the desk of the worker holding the claim. |
-| `blocked` | Meeting room | The card on the table, with a "Needs you" tag showing the question. |
-| `completed` | Shipped | Shelves of finished cards. Only the newest ones are shown, with a count of the rest. |
-| `failed` | Fix-it bay | The card on the workbench. A card that has a replacement (`replaces`) is shown faded. |
-| `canceled` | Archive | The card on a stack of boxes. |
-| none | Kitchen | Workers with no live claim. The cost meter is here too. |
+| Waiting on tasks | `waiting` | Oldest first |
+| Ready | `ready` | Oldest first, the order claims take them (FIFO) |
+| In progress | `claimed` | Longest held first |
+| Needs you | `blocked` | Oldest first, shown in red |
+| Done | `completed` | Newest first. The newest few are shown, then "+ N more" |
+
+`failed` and `canceled` are folded into the sidebar under **Closed**, with a count each. Clicking one opens it as a list.
+
+**A card shows:**
+
+- The task id and title, with a state icon (dashed ring, ring, half-filled ring, red alert, check, cross, dash).
+- The channel as a chip, with a dot in the pool's colour.
+- The worker holding the claim, as a small avatar coloured by pool. An empty dashed circle means nobody holds it.
+- What it waits on ("waits on T-3B, T-3D") or a met dependency ("T-3A done").
+- Cost so far, from its `usage=attempt` replies.
+- **In progress only:** a thin lease bar, filled by `TaskClaimed` and `LeaseRenewed` and measured against the server's `now`. The page never decides on its own that a lease has ended. Only a `LeaseExpired` event moves the card (14.1).
+- **Needs you only:** the question from `TaskBlocked`, who asked and when. The Answer and Reassign buttons are drawn but disabled in this version (20.8).
+
+A task that has been replaced (`replaces`) shows a small "retried as T-x" link instead of standing on its own.
+
+**Sidebar:** board name and live dot; Board, Events, Workers and Cost pages; each pool with how many of its workers are busy ("2/3 busy"); Closed counts; today's spend and the cost per finished task.
+
+**Top bar:** the board name, a Board, List or Timeline switch (only Board in this version), filters for pool and channel, "Hide done", and the theme button.
+
+**Event strip:** the last two events in plain words ("rust-2 completed Trim export memory"), with their positions, and the daemon address and head position on the right.
 
 - **Workers** are the profiles seen in claims (`TaskClaimed.data.profile`). Their pool and model come from the `pool` and `model` fields of their `usage=attempt` replies (18). Until a worker posts usage, it shows as "pool unknown". Nothing is guessed from the profile name.
-- **Shirt colour** is the pool. **Card colour** is the channel.
-- **Dependencies** are drawn as arcs between cards, but only for the card you hover over or select. Drawing every arc all the time is too busy in 3D.
-- **The lease bar** under a claimed card is filled by `TaskClaimed` and `LeaseRenewed`, measured against the server's `now`. The view never decides on its own that a lease has ended. Only a `LeaseExpired` event moves the card (14.1).
 
 ### 20.2 Declarative from end to end
 
-The view never moves anything by hand. It follows three steps, and each one depends only on the step before:
+The page never edits the screen by hand. It follows three steps, and each one depends only on the step before:
 
-1. **State** is a fold of the event log: snapshot, then stream (14.1). It is the same fold for every view.
-2. **Layout** is declared per room: which state it holds, and its slots (seats, counter spots, desks, shelves). A card's place comes from its state and its position in that room's list.
-3. **The scene** follows the layout. When a card's room changes, the renderer animates it there. If the task has a claim owner, that worker is drawn carrying it. Animation is only in-between frames. It never changes what the state says.
+1. **State** is a fold of the event log: snapshot, then stream (14.1). It is the same fold any future view would use.
+2. **Columns** are declared: which state each column holds, how it sorts, and how many cards it shows before "+ N more".
+3. **Render** turns columns into HTML. When an event arrives, the fold changes, the affected columns re-render, and a card that changed column slides to its new place. The animation is only in-between frames. It never changes what the state says.
 
-The same state with the same layout always draws the same picture. That makes the view testable without a browser: feed it events, then check where each card lands.
+The same state always draws the same page. That makes it testable without a browser: feed it events, then check which column each card is in and in what order.
 
-### 20.3 Day and night
+### 20.3 Light and dark
 
-One view, two themes. They share the scene, the state and the data. Only the lighting, the colours and the panel layout change.
+One page, two themes. They share everything except colours.
 
-- **Day (A):** a bright office with soft shadows, and frosted white panels.
-- **Night (B):** a dark office lit by desk lamps and glowing monitors, and dark glass panels.
-- The theme follows the operating system's light or dark setting. A button switches it, and the choice is remembered in the browser (`localStorage`). Open question 3 asks whether to follow the clock instead.
+- **Light (J):** off-white background, white cards, a light grey sidebar.
+- **Dark (K):** near-black background, dark grey cards, a darker sidebar.
+- The theme follows the operating system's light or dark setting. The button switches it, and the choice is remembered in the browser (`localStorage`).
+- Colours are CSS variables, so a theme is one block of variables and nothing else.
 
-### 20.4 Panels
+### 20.4 Interaction
 
-The panels float over the office and hold no state of their own. They read the same fold as the scene.
-
-| Panel | Day (A) | Night (B) |
-| --- | --- | --- |
-| Board name, live dot, head position | Top left | Top left, smaller |
-| Count for each state | A strip across the top | A room list down the right side, which also flies the camera to that room |
-| Cost today, and cost per finished task | Top right, with a bar per hour and a split by pool | Top of the right side |
-| Selected task | A full panel on the right: state, worker, lease, dependencies, history | A small popup next to the card, with a link to its history |
-| Event stream | A card at the bottom left, showing the last few events | A one-line ticker along the bottom |
-| View controls | Bottom centre: turn, zoom, day or night, Office or Board | In the ticker bar |
-
-Clicking a card or a worker selects it. Clicking empty floor clears the selection. Selecting a worker shows its pool, model, current task, task count and spend.
+- Clicking a card opens a side panel: state, worker, lease, dependencies both ways, cost, and the task's event history. Esc closes it.
+- Hovering a card highlights the cards it waits on and the cards waiting on it.
+- Clicking a pool in the sidebar filters the columns to that pool. Clicking it again clears the filter.
+- Clicking a Closed count lists those tasks in the side panel.
+- The keyboard works throughout: Tab moves between cards, Enter opens one.
 
 ### 20.5 How it is served
 
-- `cork serve` serves the view at `/ui/`. That path is already reserved (14.4, 13.1), so the view has the daemon's own origin and needs no CORS.
-- The files are built into the `cork` binary with `include_bytes!`: `index.html`, `app.js`, `app.css`, and a pinned copy of three.js. There is no npm, no bundler and no build step. Updating three.js means replacing one vendored file.
-- The office is built in code from simple shapes, as in the mockups. It loads no 3D model files and no web fonts, so the view works offline.
-- **Size budget:** under 400 KB compressed for everything, of which three.js is about 150 KB.
+- `cork serve` serves the page at `/ui/`. That path is already reserved (14.4, 13.1), so the page has the daemon's own origin and needs no CORS.
+- The files are built into the `cork` binary with `include_bytes!`: `index.html`, `app.css`, and a few small ES modules. There is no npm, no bundler and no build step.
+- It loads no web fonts and no third-party scripts, so it works offline. It uses the system font stack.
+- **Size budget:** under 60 KB compressed for everything.
 - **Headers:** `Content-Security-Policy: default-src 'self'; img-src 'self' data:; frame-ancestors 'none'`, plus `X-Content-Type-Options: nosniff`. File names carry a content hash, so they can be cached for good.
-- **No WebGL** (old machines, some remote desktops): the page says so and shows the panels over a plain list of rooms and cards.
-- **Battery:** the page stops drawing while its tab is hidden. When nothing is moving, it draws only after an event or a camera move.
+- **Battery:** the page does nothing between events. Lease bars update once a second while a tab is visible.
 
 ### 20.6 Signing in
 
@@ -1620,36 +1627,35 @@ Everything comes from routes that exist today, plus one optional route:
 
 - **Snapshot:** `/v1/whoami`, then `/v1/tasks` for every state, with `dependencies` and `dependents` (6.8.7).
 - **Live:** `/v1/events/stream?after=<lowest head>`, resuming with `Last-Event-ID` (14.2).
-- **Workers seen before the page opened:** the view reads today's `TaskClaimed` events and `usage=attempt` replies once at start (`/v1/events?type=…`), so idle workers show up in the kitchen.
+- **Workers seen before the page opened:** the page reads today's `TaskClaimed` events and `usage=attempt` replies once at start (`/v1/events?type=…`), so pool counts are right from the first frame.
 - **Cost:** see open question 2.
 
 ### 20.8 Not in this version
 
-- Buttons that change anything: unblock, cancel, reopen. These come later through the normal routes with a write session (14.3).
-- The replay slider from direction C. The fold makes it possible later.
-- Free camera flying. The camera stays a tilted top-down view: you can turn it in steps, zoom, and fly to a room.
-- Phones. The view should load on a phone, but it is designed for a laptop screen.
+- Buttons that change anything: answer, reassign, unblock, cancel, reopen. They are drawn disabled. They come later through the normal routes with a write session (14.3).
+- The List and Timeline views. The switch is there; only Board works.
+- Dragging cards between columns. State changes only come from events.
+- Phones. The page should load on a phone and scroll its columns sideways, but it is designed for a laptop screen.
 - More than one board, and server mode.
 
 ### 20.9 Layout of the code
 
 - `crates/cork-server/ui/` holds the static files. A small `ui.rs` in `cork-server` serves them with the headers above.
-- `app.js` is split into three plain modules matching 20.2: `state.js` (the fold, with no DOM and no three.js), `layout.js` (rooms and slots), and `scene.js` (three.js). Only `scene.js` touches WebGL.
-- `state.js` and `layout.js` are tested with Node's built-in test runner against recorded event logs. That needs no npm packages, and GitHub's runners already have Node.
+- The script is split into plain modules matching 20.2: `state.js` (the fold, with no DOM), `columns.js` (column rules), and `render.js` (the only module that touches the DOM).
+- `state.js` and `columns.js` are tested with Node's built-in test runner against recorded event logs. That needs no npm packages, and GitHub's runners already have Node.
 
 ### 20.10 Done when
 
-1. `cork inspect` opens the view, signed in, and the view shows a live board within two seconds on a board of 1,000 tasks.
+1. `cork inspect` opens the page, signed in, and it shows a live board within one second on a board of 1,000 tasks.
 2. Every event type in 6.3 has a fold test, and the fold matches `GET /v1/tasks` after replaying a recorded `cork-stress` log.
 3. Opening the page with no session, with an expired code, or from another origin fails safely. A `POST` with only the cookie gets `forbidden`.
 4. Killing and restarting the stream mid-run leaves no gaps and no repeats (14.1 step 3).
-5. The files add under 400 KB compressed to the binary. `cargo build` needs nothing beyond Rust.
-6. Day and night both match the two artboards closely enough that Chris signs them off.
+5. The files add under 60 KB compressed to the binary. `cargo build` needs nothing beyond Rust.
+6. Light and dark both match artboards J and K closely enough that Chris signs them off.
 
 ### 20.11 Open questions for Chris
 
 1. **Command name.** `cork inspect` (my pick, since it says what you do with it) or `cork ui`?
 2. **Cost numbers.** Add `GET /v1/stats?since=`, which reuses `cork-stats` so the numbers match `cork stats` exactly (my pick), or have the page add up the usage replies itself?
-3. **Theme switching.** Follow the operating system's light or dark setting (my pick), or follow the clock?
-4. **A flat "Board" fallback.** Keep a plain list view behind the Office or Board switch for reading many titles, or only show it when WebGL is missing?
-5. **Release.** Ship it as `0.3.0` and move server mode to `0.4.0` (docs/releasing.md 2), or keep the plan and ship it in `0.4.0`?
+3. **Done column.** Show today's completed tasks only (my pick), or the newest N whatever their age?
+4. **Release.** Ship it as `0.3.0` and move server mode to `0.4.0` (docs/releasing.md 2), or keep the plan and ship it in `0.4.0`?
