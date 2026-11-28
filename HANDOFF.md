@@ -10,7 +10,7 @@ Read this file first. Then start at "Milestone 1".
 
 **Added 2026-11-27, planned for Milestone 2, not to be built yet:** worker fleets with keyword routing (16), and a lead agent with parent and child tasks (17). **Planned for Milestone 3:** observability of performance, cost and usage (18).
 
-**Proposed 2026-11-28, not built:** wildcard channel patterns, and several patterns in one selector (19).
+**Added 2026-11-28, planned, not built:** wildcard channel patterns, and several patterns in one selector (19). Signed off by Chris on 2026-11-28.
 
 **Added 2026-11-27, planned, not built:** task dependencies and the `waiting` state, in the core (6.8). Signed off by Chris on 2026-11-27, including both decisions in 6.8.10.
 
@@ -1404,7 +1404,7 @@ The log stays the source of truth. Traces are for following one task across syst
 
 ## 19. Channel patterns (planned, not built)
 
-**Status:** proposed 2026-11-28 for Chris's review. Not to be built until he says go. The open choices are in 19.9.
+**Status:** signed off by Chris on 2026-11-28, including the three decisions in 19.9. Not to be built until he says go.
 
 Today a selector is `work`, which means that channel only, or `work/`, which means `work` and everything under it (4). This section adds real wildcard patterns and lets one selector hold several patterns. The board does the matching, so every read, wait, stream and claim understands the same patterns. A fleet pool's `select` is just one more selector.
 
@@ -1422,7 +1422,7 @@ A pattern is a channel path in which a whole segment may be a wildcard:
 | `**` | every channel | |
 
 - `*` stands for exactly one segment. `**` stands for any number of segments, including none.
-- A wildcard is always a whole segment. `work-*` and `*-tests` are refused for now (19.9, question 1).
+- A wildcard is always a whole segment. `work-*` and `*-tests` are refused for now (19.9, decision 1).
 - `work/` keeps its meaning. It is short for `work/**`, so every existing selector, config and script works unchanged.
 - **The patterns can never be confused with real channels.** `*` is not a legal channel character (4), so the board can always tell a pattern from a channel name.
 - Limits: the same depth (8 segments) and length (200 bytes) as a channel, with any number of wildcards.
@@ -1444,7 +1444,7 @@ A pattern that starts with `!` takes channels away: a channel matches if it matc
 select = ["**", "!features/"]   # everything except features
 ```
 
-A selector made only of `!` patterns is refused, because it would match nothing. Whether to have exclusions at all is question 2 in 19.9.
+A selector made only of `!` patterns is refused, because it would match nothing. Confirmed in 19.9, decision 2.
 
 ### 19.4 Where matching lives
 
@@ -1508,11 +1508,11 @@ fleet gives it to: general
 
 With `--channel <name>` it answers the same question for a task that doesn't exist yet.
 
-### 19.9 Open questions for Chris
+### 19.9 Decisions confirmed by Chris (2026-11-28)
 
-1. **Partial segments.** Should `work-*` or `*-tests` match part of a segment? Suggested: not yet. Whole segments keep the rules short and the queries index-friendly, and adding partial matches later is additive.
-2. **Exclusions.** Do you want the `!` exclusions in 19.3? Suggested: yes, because without them `**` can't be used safely next to the lead pool.
-3. **Overlap.** Is reporting overlap (19.7) enough, or should `workers up` refuse overlapping pools unless they're marked as overlapping on purpose? Suggested: report only, because overlap is how a strong pool helps out when the cheap one is busy (16.6).
+1. **No partial segments for now.** `work-*` and `*-tests` are refused. A wildcard is always a whole segment. Adding partial matches later would be additive.
+2. **Exclusions are in.** `!` patterns work as in 19.3, so `**` can sit safely beside the lead pool.
+3. **Overlap is reported, not refused** (19.7). Overlap is how a strong pool helps out when the cheap one is busy (16.6).
 
 ### 19.10 Done when
 
