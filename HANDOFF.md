@@ -10,6 +10,8 @@ Read this file first. Then start at "Milestone 1".
 
 **Added 2026-11-27, planned for Milestone 2, not to be built yet:** worker fleets with keyword routing (16), and a lead agent with parent and child tasks (17). **Planned for Milestone 3:** observability of performance, cost and usage (18).
 
+**Proposed 2026-11-28, not built:** wildcard channel patterns, and several patterns in one selector (19).
+
 **Added 2026-11-27, planned, not built:** task dependencies and the `waiting` state, in the core (6.8). Signed off by Chris on 2026-11-27, including both decisions in 6.8.10.
 
 ---
@@ -98,7 +100,7 @@ Board
 ```
 
 - **Channel path.** Segments of `[A-Za-z0-9_.-]`, joined by `/`, at most 8 deep and 200 bytes. Leading and trailing `/` are trimmed when stored. A segment may not be 26 characters that read as a ULID, so a channel can never be mistaken for an id.
-- **Channel selector.** Reads, waits and claims take a selector. `work` means that channel only. `work/` means `work` and every channel under it. `workshop` never matches `work/`.
+- **Channel selector.** Reads, waits and claims take a selector. `work` means that channel only. `work/` means `work` and every channel under it. `workshop` never matches `work/`. Wildcard patterns and lists of patterns are proposed in 19.
 - **Labels** are `key=value` pairs on a message, such as `step=fix`. One value per key. Keys are ASCII `[A-Za-z0-9_./-]`, up to 64 bytes. Values are UTF-8, NFC-normalized when written, matched byte for byte, up to 256 bytes. At most 32 labels per message. Agents filter on them and wait for them.
 - **Reserved labels.** Labels that start with `board.` belong to the board. The prefix stays `board.`, not `cork.`, so labels match Vercel Board's and agent skills carry over. Users cannot set them (`reserved_label`). They can filter on them. The board sets:
   - `board.task=<state>` on a task's root.
@@ -1012,7 +1014,7 @@ max_workers = 12            # cap across all pools
 
 [pool.strong]
 model = "opus"
-select = "work/"            # channel selector
+select = "work/"            # channel selector (patterns and lists: 19.6)
 count = 2                   # initial size; min and max bound scaling
 min = 0
 max = 6
@@ -1399,3 +1401,124 @@ The log stays the source of truth. Traces are for following one task across syst
 5. **`/metrics`:** the daemon's counters match the log after a stress run (`cork-stress` checks them alongside its invariants). Scraping adds no measurable write latency.
 6. **No core change:** everything except `/metrics` runs against an unmodified Milestone 2 daemon.
 7. **A real report:** the measured runs of 17.5 are re-read with `cork stats`, and the write-up in `docs/` shows cost per successful task by model for each setup.
+
+## 19. Channel patterns (planned, not built)
+
+**Status:** proposed 2026-11-28 for Chris's review. Not to be built until he says go. The open choices are in 19.9.
+
+Today a selector is `work`, which means that channel only, or `work/`, which means `work` and everything under it (4). This section adds real wildcard patterns and lets one selector hold several patterns. The board does the matching, so every read, wait, stream and claim understands the same patterns. A fleet pool's `select` is just one more selector.
+
+### 19.1 Pattern syntax
+
+A pattern is a channel path in which a whole segment may be a wildcard:
+
+| Pattern | Matches | Does not match |
+| --- | --- | --- |
+| `work` | `work` | `work/fix` |
+| `work/*` | `work/fix`, `work/docs` | `work`, `work/fix/tests` |
+| `work/*/tests` | `work/api/tests`, `work/cli/tests` | `work/tests`, `work/api/unit/tests` |
+| `work/**` | `work`, `work/fix`, `work/api/tests` | `workshop` |
+| `**/tests` | `tests`, `work/tests`, `work/api/tests` | `work/tests/unit` |
+| `**` | every channel | |
+
+- `*` stands for exactly one segment. `**` stands for any number of segments, including none.
+- A wildcard is always a whole segment. `work-*` and `*-tests` are refused for now (19.9, question 1).
+- `work/` keeps its meaning. It is short for `work/**`, so every existing selector, config and script works unchanged.
+- **The patterns can never be confused with real channels.** `*` is not a legal channel character (4), so the board can always tell a pattern from a channel name.
+- Limits: the same depth (8 segments) and length (200 bytes) as a channel, with any number of wildcards.
+
+### 19.2 Several patterns in one selector
+
+A selector is a set of one or more patterns. A channel matches if any of them matches. The order doesn't matter, and the same pattern twice counts once.
+
+- **API:** `channel` may repeat, like `label` does: `/v1/tasks?channel=work/*/tests&channel=docs/`. A claim body takes `channels: [...]` beside the old `channel`.
+- **CLI:** one argument with the patterns separated by commas: `cork tasks list 'work/*/tests,docs/'`. A comma can't appear in a channel name, so this is never ambiguous.
+- **Fleet:** `select` takes a string or a list (19.6).
+- At most 16 patterns in one selector. More is `invalid_input`.
+
+### 19.3 Exclusions
+
+A pattern that starts with `!` takes channels away: a channel matches if it matches at least one ordinary pattern and none of the `!` patterns. The order still doesn't matter.
+
+```toml
+select = ["**", "!features/"]   # everything except features
+```
+
+A selector made only of `!` patterns is refused, because it would match nothing. Whether to have exclusions at all is question 2 in 19.9.
+
+### 19.4 Where matching lives
+
+The matcher sits in `cork-core`, as one function: `ChannelSelector::matches(channel)`. Everything uses that one function, so no two places can disagree about a match:
+
+- the in-memory matching of waiters and streams (7.4),
+- the first-come, first-served claim queue (6.5),
+- the store adapter's queries, which the contract suite (5.4) checks against core,
+- the fleet's dispatcher, `workers match` and `workers status`,
+- the stress checker's model.
+
+### 19.5 What changes for reads, waits and claims
+
+- **Reads (`read`, `tasks list`, `/events` catch-up, `debug export`).** Inside the read transaction, the adapter matches the patterns against the `channels` table, and the query then filters on that list of exact channels (`channel IN (...)`). That uses the existing `(channel, …)` indexes. Because the list is made in the same transaction, a read never sees a channel half-created. If the list grows past 500 channels, the adapter falls back to scanning by the longest literal prefix and filtering with the core matcher. That is still correct, just slower. The stress test reports both.
+- **Waits and streams.** These are matched in memory against each committed event's channel (7.4). A channel created after the wait started is matched like any other. The cost is one pattern check per waiter per event, a few hundred nanoseconds, with no extra queries.
+- **`claim --ready`.** The rule is unchanged: in one write transaction, take the oldest ready task that matches. Only "matches" now means the pattern set. Waiting claims stay first come, first served (6.5).
+- **The SSE stream and UIs (14).** These take the same repeated `channel` parameter. `Last-Event-ID` resume is unchanged.
+- **Stable contracts (7.6).** All of this is additive. Old clients send `work` or `work/`, which mean what they always meant. A new client talking to an old daemon is stopped by the version check (8.4), not by a wrong match.
+- **The shell.** `*` and `**` must be quoted on the command line (`'work/*'`), or the shell may expand them into file names. The CLI help and the skill say so.
+
+### 19.6 Fleet pools
+
+```toml
+[pool.tests]
+model = "haiku"
+select = ["work/*/tests", "ci/**"]
+
+[pool.general]
+model = "sonnet"
+select = ["**", "!features/"]
+
+[pool.lead]
+model = "opus"
+select = "features/"
+```
+
+- `select` takes one pattern or a list. The supervisor sends it to the board as one selector, so a pool with five patterns costs one listing per round, not five.
+- Autoscale counts the ready tasks the pool covers (16.5). That count already uses the matcher, so it needs no change.
+- **The lead stays alone on features.** Today worker pools "never select `features/`" (17.1). With `**`, a pool could take features by mistake. `workers up` and `reload` therefore refuse a pool that can match `features/` unless it is the lead pool (its `select` names `features/`), or it excludes `features/`. That keeps the rule declarative: the config says which pool may take features, and Cork checks it.
+
+### 19.7 Overlap between pools
+
+Pools may overlap, as they can today. The rule for picking one doesn't change: among the pools that cover a task, the cheapest wins (16.4).
+
+Wildcards make overlap easy to create without noticing, so Cork reports it rather than refusing it:
+
+- `workers up`, `reload` and `status` list each pair of pools whose selectors overlap on a channel that exists now, and say which pool wins there for a task with no needs. For example: `fast and general overlap on work/api/tests; fast wins (cheaper)`. This is information, not an error.
+
+### 19.8 How `workers match` explains a pick
+
+`match` names the pattern that matched, or says why nothing did:
+
+```text
+$ cork workers match 01JTASK...
+task in work/api/tests, needs rust
+tests:   no rust (select work/*/tests matched)
+general: covers (select ** matched)
+lead:    channel not selected (features/ only)
+fleet gives it to: general
+```
+
+With `--channel <name>` it answers the same question for a task that doesn't exist yet.
+
+### 19.9 Open questions for Chris
+
+1. **Partial segments.** Should `work-*` or `*-tests` match part of a segment? Suggested: not yet. Whole segments keep the rules short and the queries index-friendly, and adding partial matches later is additive.
+2. **Exclusions.** Do you want the `!` exclusions in 19.3? Suggested: yes, because without them `**` can't be used safely next to the lead pool.
+3. **Overlap.** Is reporting overlap (19.7) enough, or should `workers up` refuse overlapping pools unless they're marked as overlapping on purpose? Suggested: report only, because overlap is how a strong pool helps out when the cheap one is busy (16.6).
+
+### 19.10 Done when
+
+1. The core matcher passes a table of cases, including every row of 19.1, exclusions, and the `work/` = `work/**` shorthand.
+2. The contract suite checks that every store query (`read`, `tasks list`, `claim --ready`, `/events` catch-up) agrees with the core matcher, for random channels and patterns, on both the `IN` list and the fallback scan.
+3. A wait, a stream and a waiting claim on `work/*/tests` wake for a channel created after they started, and not for `work/tests`.
+4. `cork-stress` runs with pattern selectors and its invariants still hold. It reports the read and claim latency against plain selectors.
+5. `workers up` refuses a non-lead pool that can match `features/`. `status` reports overlaps. `match` names the matching pattern.
+6. Every selector from Milestones 1 to 3 behaves exactly as before.
