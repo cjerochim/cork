@@ -1402,9 +1402,9 @@ The log stays the source of truth. Traces are for following one task across syst
 6. **No core change:** everything except `/metrics` runs against an unmodified Milestone 2 daemon.
 7. **A real report:** the measured runs of 17.5 are re-read with `cork stats`, and the write-up in `docs/` shows cost per successful task by model for each setup.
 
-## 19. Channel patterns (planned, not built)
+## 19. Channel patterns
 
-**Status:** signed off by Chris on 2026-11-28, including the three decisions in 19.9. Not to be built until he says go.
+**Status:** signed off by Chris on 2026-11-28, including the three decisions in 19.9, and built the same day.
 
 Today a selector is `work`, which means that channel only, or `work/`, which means `work` and everything under it (4). This section adds real wildcard patterns and lets one selector hold several patterns. The board does the matching, so every read, wait, stream and claim understands the same patterns. A fleet pool's `select` is just one more selector.
 

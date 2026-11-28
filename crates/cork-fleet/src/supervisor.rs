@@ -9,8 +9,8 @@
 //! head count.
 
 use crate::config::{Fleet, Pool};
-use crate::routing::{TaskFacts, choose, rank, verdict};
-use cork_api::TasksPage;
+use crate::routing::{TaskFacts, choose, overlaps, rank, verdict};
+use cork_api::{ChannelsOut, TasksPage};
 use cork_client::home::{Connect, reconnect};
 use cork_client::{Client, query};
 use serde_json::{Value, json};
@@ -277,6 +277,14 @@ pub async fn run(o: Options) -> Result<i32, String> {
             st.pools.len(),
             sock.display()
         );
+    }
+
+    {
+        let channels = board_channels(&shared).await;
+        let st = shared.state.lock().await;
+        for o in pool_overlaps(&st, &channels) {
+            eprintln!("cork workers: {o}");
+        }
     }
 
     tokio::spawn(follow(shared.clone(), me.head));
@@ -1100,6 +1108,32 @@ async fn control(shared: Arc<Shared>, listener: tokio::net::UnixListener) {
     }
 }
 
+/// The channels on the board now, for overlap reports. Empty if the board
+/// can't be reached: the report is information, never a reason to fail.
+async fn board_channels(shared: &Shared) -> Vec<String> {
+    let client = shared.client.lock().await.clone();
+    client
+        .get("/channels")
+        .await
+        .ok()
+        .and_then(|v| serde_json::from_value::<ChannelsOut>(v).ok())
+        .map(|c| c.channels.into_iter().map(|c| c.path).collect())
+        .unwrap_or_default()
+}
+
+/// Overlaps between the pools still in the config (HANDOFF 19.7).
+fn pool_overlaps(st: &State, channels: &[String]) -> Vec<String> {
+    let pools = st
+        .pools
+        .values()
+        .filter(|p| !p.removed)
+        .map(|p| p.spec.as_ref());
+    overlaps(pools, channels, &st.person)
+        .iter()
+        .map(|o| o.to_string())
+        .collect()
+}
+
 fn err(msg: impl Into<String>) -> Value {
     json!({"ok": false, "error": msg.into()})
 }
@@ -1108,8 +1142,11 @@ async fn handle(shared: &Arc<Shared>, req: &Value) -> Value {
     let op = req["op"].as_str().unwrap_or("");
     let reply = match op {
         "status" => {
+            let channels = board_channels(shared).await;
             let st = shared.state.lock().await;
-            status(&st)
+            let mut v = status(&st);
+            v["overlaps"] = json!(pool_overlaps(&st, &channels));
+            v
         }
         "metrics" => {
             let st = shared.state.lock().await;
@@ -1137,8 +1174,18 @@ async fn handle(shared: &Arc<Shared>, req: &Value) -> Value {
             }
         }
         "reload" => {
+            let channels = board_channels(shared).await;
             let mut st = shared.state.lock().await;
-            reload(&mut st)
+            let mut v = reload(&mut st);
+            if v["ok"] == true {
+                let o = pool_overlaps(&st, &channels);
+                if !o.is_empty() {
+                    let m = v["message"].as_str().unwrap_or("").to_string();
+                    v["message"] = json!(format!("{m}\n{}", o.join("\n")));
+                }
+                v["overlaps"] = json!(o);
+            }
+            v
         }
         "down" => {
             let now = req["now"].as_bool().unwrap_or(false);

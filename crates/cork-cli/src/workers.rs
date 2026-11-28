@@ -4,7 +4,7 @@
 
 use cork_api::TaskOut;
 use cork_client::{Client, ClientError};
-use cork_fleet::routing::{TaskFacts, Verdict, model_verdict, rank, verdict};
+use cork_fleet::routing::{TaskFacts, Verdict, channel_note, model_verdict, rank, verdict};
 use cork_fleet::{Catalog, Fleet, Needs};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -138,17 +138,19 @@ pub fn keywords(l: &Loaded, json_out: bool) {
     }
 }
 
-/// `cork workers match <task-id | --needs k1,k2>`.
+/// `cork workers match <task-id | --needs k1,k2 [--channel c]>`.
 pub async fn matches(
     l: &Loaded,
     client: Option<&Client>,
     task_id: Option<&str>,
     needs: &[String],
+    channel: Option<&str>,
     json_out: bool,
 ) -> Result<i32, ClientError> {
     let c = &l.catalog;
-    let (facts, person, place) = match (task_id, needs.is_empty()) {
-        (Some(id), true) => {
+    let planned = !needs.is_empty() || channel.is_some();
+    let (mut facts, person, mut place) = match (task_id, planned) {
+        (Some(id), false) => {
             let client = client.expect("a task id needs the board");
             let v = client.task(id).await?;
             let t: TaskOut = serde_json::from_value(v)
@@ -156,7 +158,7 @@ pub async fn matches(
             let person = client.whoami().await?.person;
             (TaskFacts::of(&t.task, c), person, true)
         }
-        (None, false) => {
+        (None, true) => {
             let mut n = Needs::default();
             match c.resolve_list(needs) {
                 Ok(k) => n.keywords = k,
@@ -169,7 +171,23 @@ pub async fn matches(
             }
             (TaskFacts::planned(n), String::new(), false)
         }
-        _ => return Err(usage("workers match takes a task id or --needs k1,k2")),
+        _ => {
+            return Err(usage(
+                "workers match takes a task id, or --needs k1,k2 and/or --channel c",
+            ));
+        }
+    };
+    if let Some(ch) = channel {
+        facts.channel = cork_core::normalize_channel(ch).map_err(|e| usage(e.message))?;
+        place = true;
+    }
+    // How each pool's select judges the channel (19.8).
+    let note = |p: &cork_fleet::Pool| -> String {
+        if place {
+            format!(" ({})", channel_note(p, &facts.channel))
+        } else {
+            String::new()
+        }
     };
 
     let mut models: Vec<&cork_fleet::Model> = c.models.values().collect();
@@ -207,10 +225,12 @@ pub async fn matches(
             .iter()
             .map(|p| {
                 let v = verdict(p, &facts, &person, place);
-                json!({"pool": p.name, "model": p.model.name, "covers": v.covers(), "why": v.to_string()})
+                let select = place.then(|| channel_note(p, &facts.channel));
+                json!({"pool": p.name, "model": p.model.name, "covers": v.covers(), "why": v.to_string(), "select": select})
             })
             .collect();
         crate::print_json(&json!({
+            "channel": place.then_some(&facts.channel),
             "needs": facts.needs.keywords,
             "unknown": facts.needs.unknown,
             "models": mrows,
@@ -220,6 +240,22 @@ pub async fn matches(
             "choice": choice.map(|p| json!({"pool": p.name, "model": p.model.name})),
         }));
     } else {
+        if place {
+            let needs: Vec<&String> = facts.needs.keywords.iter().collect();
+            println!(
+                "task in {}, needs {}",
+                facts.channel,
+                if needs.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    needs
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+        }
         for (m, v) in &model_rows {
             let mut line = format!("{}: {v}", m.name);
             if v.covers()
@@ -240,10 +276,11 @@ pub async fn matches(
         if let Some(f) = &l.fleet {
             for p in &pools {
                 println!(
-                    "pool {} ({}): {}",
+                    "pool {} ({}): {}{}",
                     p.name,
                     p.model.name,
-                    verdict(p, &facts, &person, place)
+                    verdict(p, &facts, &person, place),
+                    note(p)
                 );
             }
             match choice {
@@ -460,6 +497,9 @@ fn print_status(v: &Value) {
             };
             println!("  {}\t{what}{d}", w["profile"].as_str().unwrap_or(""));
         }
+    }
+    for o in v["overlaps"].as_array().into_iter().flatten() {
+        println!("{}", o.as_str().unwrap_or(""));
     }
     let un = v["unmatched"].as_array().cloned().unwrap_or_default();
     if !un.is_empty() {

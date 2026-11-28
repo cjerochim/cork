@@ -26,7 +26,9 @@ impl TaskFacts {
         }
     }
 
-    /// A task that does not exist yet, for `match --needs`.
+    /// A task that does not exist yet, for `match --needs`. Its channel is
+    /// empty unless `match --channel` names one; its owner is unknown, so
+    /// `from` is not checked.
     pub fn planned(needs: Needs) -> Self {
         Self {
             channel: String::new(),
@@ -84,6 +86,7 @@ pub fn verdict(pool: &Pool, t: &TaskFacts, person: &str, check_place: bool) -> V
             return Verdict::Channel(t.channel.clone());
         }
         let from_ok = match pool.from.as_deref() {
+            _ if t.owner.is_empty() => true,
             Some("*") => true,
             Some(p) => p.eq_ignore_ascii_case(&t.owner),
             None => person.eq_ignore_ascii_case(&t.owner),
@@ -115,6 +118,92 @@ pub fn verdict(pool: &Pool, t: &TaskFacts, person: &str, check_place: bool) -> V
         }
     }
     Verdict::Covers
+}
+
+/// How a pool's `select` judges a channel, for `workers match` (19.8):
+/// the pattern that matched, the exclusion that took it away, or what the
+/// pool selects instead.
+pub fn channel_note(pool: &Pool, channel: &str) -> String {
+    if let Some(p) = pool.select.matched_by(channel) {
+        return format!("select {p} matched");
+    }
+    if let Some(x) = pool.select.excluded_by(channel) {
+        return format!("excluded by !{x}");
+    }
+    let only: Vec<String> = pool
+        .select
+        .includes()
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+    format!("{} only", only.join(", "))
+}
+
+/// Two pools that both select a channel on the board now (HANDOFF 19.7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Overlap {
+    pub a: String,
+    pub b: String,
+    /// The first shared channel, in path order.
+    pub channel: String,
+    /// How many other shared channels there are.
+    pub more: usize,
+    /// Which of the two takes a task with no needs there, if either does.
+    pub winner: Option<String>,
+}
+
+impl std::fmt::Display for Overlap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} and {} overlap on {}", self.a, self.b, self.channel)?;
+        if self.more > 0 {
+            write!(f, " (and {} more)", self.more)?;
+        }
+        match &self.winner {
+            Some(w) => write!(f, "; {w} wins (cheaper)"),
+            None => write!(f, "; neither takes a task with no needs there"),
+        }
+    }
+}
+
+/// Every pair of pools whose selectors share a channel from `channels`.
+/// Overlap is allowed; this only reports it, so it is easy to notice.
+pub fn overlaps<'a, I>(pools: I, channels: &[String], person: &str) -> Vec<Overlap>
+where
+    I: IntoIterator<Item = &'a Pool>,
+{
+    let pools: Vec<&Pool> = pools.into_iter().collect();
+    let mut sorted: Vec<&String> = channels.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    let mut out = vec![];
+    for (i, a) in pools.iter().enumerate() {
+        for b in &pools[i + 1..] {
+            let shared: Vec<&&String> = sorted
+                .iter()
+                .filter(|c| a.select.matches(c) && b.select.matches(c))
+                .collect();
+            let Some(first) = shared.first() else {
+                continue;
+            };
+            let t = TaskFacts {
+                channel: first.to_string(),
+                owner: person.to_string(),
+                assignee: None,
+                needs: Needs::default(),
+            };
+            let winner = rank([*a, *b], &t, person, true)
+                .first()
+                .map(|p| p.name.clone());
+            out.push(Overlap {
+                a: a.name.clone(),
+                b: b.name.clone(),
+                channel: first.to_string(),
+                more: shared.len() - 1,
+                winner,
+            });
+        }
+    }
+    out
 }
 
 /// Cheapest first: by cost (a model with no cost after any with one), then
@@ -270,6 +359,53 @@ mod tests {
             Verdict::Exclusive(_)
         ));
         assert!(verdict(strong, &facts(&f, &["rust", "tier-3"]), "chris", true).covers());
+    }
+
+    #[test]
+    fn notes_and_overlaps() {
+        let w = r#"
+[fleet]
+name = "dev"
+models = "m"
+[pool.tests]
+model = "haiku"
+select = "work/*/tests"
+[pool.general]
+model = "sonnet"
+select = ["**", "!features/"]
+[pool.lead]
+model = "opus"
+select = "features/"
+"#;
+        let f = Fleet::parse(w, EXAMPLE).unwrap();
+        let p = |n: &str| &f.pools[n];
+        assert_eq!(
+            channel_note(p("tests"), "work/api/tests"),
+            "select work/*/tests matched"
+        );
+        assert_eq!(
+            channel_note(p("general"), "work/api/tests"),
+            "select ** matched"
+        );
+        assert_eq!(channel_note(p("lead"), "work/api/tests"), "features/ only");
+        assert_eq!(
+            channel_note(p("general"), "features/x"),
+            "excluded by !features/"
+        );
+        let chans: Vec<String> = ["work/api/tests", "work/cli/tests", "features/x", "docs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let o = overlaps(f.pools.values(), &chans, "chris");
+        assert_eq!(o.len(), 1, "{o:?}");
+        assert_eq!(
+            o[0].to_string(),
+            "general and tests overlap on work/api/tests (and 1 more); tests wins (cheaper)"
+        );
+        // A planned task has no owner, so `from` is not checked.
+        let mut t = TaskFacts::planned(Needs::default());
+        t.channel = "work/api/tests".into();
+        assert!(verdict(p("tests"), &t, "", true).covers());
     }
 
     #[test]

@@ -31,7 +31,7 @@ struct RawFleet {
 #[serde(deny_unknown_fields)]
 struct RawPool {
     model: String,
-    select: String,
+    select: RawSelect,
     count: Option<usize>,
     min: Option<usize>,
     max: Option<usize>,
@@ -47,6 +47,17 @@ struct RawPool {
     exclusive: bool,
     autoscale: Option<RawAutoscale>,
 }
+
+/// `select = "work/"` or `select = ["work/*/tests", "ci/**"]` (HANDOFF 19.6).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawSelect {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// The channel only the lead pool may take (HANDOFF 17.1, 19.6).
+pub const LEAD_CHANNEL: &str = "features";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -197,8 +208,20 @@ fn build_pool(
         .get(&p.model)
         .ok_or_else(|| format!("pool `{name}`: no model `{}` in the catalog", p.model))?
         .clone();
-    let select = ChannelSelector::parse(&p.select)
+    let parts = match &p.select {
+        RawSelect::One(s) => vec![s.clone()],
+        RawSelect::Many(v) => v.clone(),
+    };
+    let select = ChannelSelector::parse_all(&parts)
         .map_err(|e| format!("pool `{name}`: select: {}", e.message))?;
+    // The lead stays alone on features: only a pool that names `features/`
+    // may match it. Any other pool must keep clear of it or exclude it.
+    if select.may_reach(LEAD_CHANNEL) && !select.names_subtree(LEAD_CHANNEL) {
+        return Err(format!(
+            "pool `{name}`: select `{select}` can match {LEAD_CHANNEL}/, which only the lead pool takes; \
+             add \"!{LEAD_CHANNEL}/\" to its select, or name \"{LEAD_CHANNEL}/\" to make it the lead pool"
+        ));
+    }
     let count = p.count.unwrap_or(1);
     let min = p.min.unwrap_or(0);
     let max = p.max.unwrap_or(max_workers.max(count));
@@ -416,11 +439,56 @@ keywords = ["rust"]
                 "[pool.a]\nmodel = \"haiku\"\nselect = \"w\"\nsize = 1",
                 "unknown field",
             ),
+            (
+                "[pool.a]\nmodel = \"haiku\"\nselect = \"work-*\"",
+                "whole segment",
+            ),
+            (
+                "[pool.a]\nmodel = \"haiku\"\nselect = \"**\"",
+                "only the lead pool takes",
+            ),
+            (
+                "[pool.a]\nmodel = \"haiku\"\nselect = [\"*/tests\"]",
+                "add \"!features/\"",
+            ),
+            (
+                "[pool.a]\nmodel = \"haiku\"\nselect = \"features/x/\"",
+                "only the lead pool takes",
+            ),
+            (
+                "[pool.a]\nmodel = \"haiku\"\nselect = [\"!work/\"]",
+                "not an exclusion",
+            ),
         ];
         for (p, want) in bad {
             let e = Fleet::parse(&format!("{head}{p}"), EXAMPLE).unwrap_err();
             assert!(e.contains(want), "{p}: {e}");
         }
+    }
+
+    #[test]
+    fn select_takes_a_string_or_a_list() {
+        let w = r#"
+[fleet]
+name = "dev"
+models = "m"
+[pool.tests]
+model = "haiku"
+select = ["work/*/tests", "ci/**"]
+[pool.general]
+model = "sonnet"
+select = ["**", "!features/"]
+[pool.lead]
+model = "opus"
+select = "features/"
+"#;
+        let f = Fleet::parse(w, EXAMPLE).unwrap();
+        let t = &f.pools["tests"].select;
+        assert!(t.matches("work/api/tests") && t.matches("ci/x/y") && !t.matches("work/tests"));
+        assert_eq!(t.to_param(), "ci/,work/*/tests");
+        let g = &f.pools["general"].select;
+        assert!(g.matches("work/a") && !g.matches("features/x"));
+        assert!(f.pools["lead"].select.matches("features/x"));
     }
 
     #[test]

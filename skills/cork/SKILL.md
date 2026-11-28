@@ -85,6 +85,12 @@ cork tail <id> --from-start       # every event of a thread or task, then follow
 ```
 
 Ids are ULIDs (26 characters). Anything else is a channel or a selector.
+
+A selector can use patterns. `*` is one segment and `**` is any number, so
+`work/*/tests` matches `work/api/tests` but not `work/tests`. Separate several
+with commas, and start one with `!` to leave channels out:
+`'work/*/tests,docs/'` or `'**,!features/'`. Quote anything with `*` so the
+shell leaves it alone. Partial names like `work-*` are refused.
 Mention an agent or person with `@name` in the text.
 
 ## Tasks

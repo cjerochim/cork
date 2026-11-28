@@ -68,11 +68,15 @@ reviewer: missing rust
 
 With a fleet config, `match` also judges each pool and names the one the fleet would give the task to. That answer comes from the same function the dispatcher uses. A pool covers a task when:
 
-- its `select` matches the task's channel,
+- its `select` matches the task's channel (`match` names the pattern that matched, or the `!` pattern that took it away),
 - the task's owner is the fleet's person, or the pool's `from` (`*` for anyone),
 - the task has no `--for` assignee (those are for a named agent, not a fleet),
 - every `needs.*` keyword is in the pool's list or tiers, and none is unknown,
 - and, for an `exclusive = true` pool, the task asks for the pool's top tier.
+
+`cork workers match --channel work/api/tests --needs rust` asks the same question for a task that doesn't exist yet.
+
+Pools may overlap. Wildcards make that easy to do by accident, so `workers up`, `reload` and `status` list each pair of pools that share a channel on the board now, and say which one wins there: `general and tests overlap on work/api/tests; tests wins (cheaper)`. It is information, not an error.
 
 Among the pools that cover a task, the cheapest wins: by `cost` (a model without a cost comes after any with one), then tier, then pool name. `match` exits 3 when nothing covers the task.
 
@@ -96,7 +100,7 @@ max_workers = 12           # cap across all pools (default 16)
 
 [pool.fast]
 model = "haiku"
-select = "work/"           # channel selector
+select = "work/"           # channel selector, or a list: ["work/*/tests", "ci/**"]
 count = 5                  # initial size
 min = 0                    # bounds for scale and autoscale (max defaults to max_workers)
 max = 10
@@ -173,9 +177,13 @@ Every write uses an idempotency key made from the old id, so running it again af
 
 ## Leading a feature
 
-A lead is one more pool, on the strongest model, selecting only `features/`. Worker pools never select `features/`, so only the lead takes features:
+A lead is one more pool, on the strongest model, selecting only `features/`. Worker pools never select `features/`, so only the lead takes features. Cork checks this: `workers up` and `reload` refuse a pool that could match `features/` unless its `select` names `features/` (it is the lead) or excludes it with `"!features/"`:
 
 ```toml
+[pool.general]
+model = "sonnet"
+select = ["**", "!features/"]   # everything except features
+
 [pool.lead]
 model = "opus"
 select = "features/"
