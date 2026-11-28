@@ -68,6 +68,20 @@ impl Authenticator for FileToken {
         let current = self.token.read().unwrap().0.clone();
         LocalToken::new(current, &self.person).authenticate(headers)
     }
+
+    /// A hash of the token now in `daemon.json`, re-read at most once a
+    /// second, so `cork token rotate` ends web sessions (20.6).
+    fn epoch(&self) -> String {
+        let stale = self.token.read().unwrap().1.elapsed() > Duration::from_secs(1);
+        if stale {
+            let mut t = self.token.write().unwrap();
+            if let Some(info) = read_daemon(&self.home) {
+                t.0 = info.token;
+            }
+            t.1 = Instant::now();
+        }
+        hex::encode(Sha256::digest(self.token.read().unwrap().0.as_bytes()))
+    }
 }
 
 pub async fn serve(o: ServeOpts) -> Result<(), String> {
@@ -148,6 +162,7 @@ pub async fn serve(o: ServeOpts) -> Result<(), String> {
             token: RwLock::new((token, Instant::now())),
         }),
         hosts: HostPolicy::loopback(port),
+        sessions: Default::default(),
     });
     eprintln!("cork: serving {} on 127.0.0.1:{port}", o.db.display());
     let shutdown = async {

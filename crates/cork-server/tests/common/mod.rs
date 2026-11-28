@@ -28,8 +28,21 @@ impl Daemon {
         d
     }
 
+    /// A fresh daemon that checks requests with `auth`.
+    pub async fn start_with(auth: Arc<dyn Authenticator>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let mut d = Self::open_with(path, None, auth).await;
+        d._dir = Some(dir);
+        d
+    }
+
     /// Open (or reopen) a daemon over the file at `path`, on `port` if given.
     pub async fn open(path: PathBuf, port: Option<u16>) -> Self {
+        Self::open_with(path, port, Arc::new(LocalToken::new(TOKEN, "chris"))).await
+    }
+
+    pub async fn open_with(path: PathBuf, port: Option<u16>, auth: Arc<dyn Authenticator>) -> Self {
         let mut cfg = SqliteConfig::new(&path);
         cfg.durability = Durability::Normal;
         let store = Arc::new(SqliteStore::open(cfg).await.unwrap());
@@ -47,8 +60,9 @@ impl Daemon {
         let port = listener.local_addr().unwrap().port();
         let app = Arc::new(App {
             board: board.clone(),
-            auth: Arc::new(LocalToken::new(TOKEN, "chris")),
+            auth,
             hosts: HostPolicy::loopback(port),
+            sessions: Default::default(),
         });
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {

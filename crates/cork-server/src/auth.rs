@@ -8,6 +8,13 @@ use subtle::ConstantTimeEq;
 pub trait Authenticator: Send + Sync + 'static {
     /// The person the request acts for, or `unauthorized`.
     fn authenticate(&self, headers: &HeaderMap) -> Result<String>;
+
+    /// Changes whenever the credential behind sessions changes, such as on
+    /// `cork token rotate`. Web sessions are tied to the value they were
+    /// issued under, so a new value ends them all (20.6).
+    fn epoch(&self) -> String {
+        String::new()
+    }
 }
 
 /// Portable mode: one token, from `daemon.json`, for the daemon's one person.

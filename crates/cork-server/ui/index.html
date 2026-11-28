@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cork board</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script type="module" src="main.js"></script>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="side">
+    <div class="brand"><span class="logo" aria-hidden="true">c</span><span class="name" id="board-name">cork</span><span class="live" id="live"><span class="dot"></span><span id="live-text">connecting</span></span></div>
+    <nav class="nav" id="nav" aria-label="Pages"></nav>
+    <div class="label">Pools</div>
+    <div id="pools" class="pools"></div>
+    <div class="label">Closed</div>
+    <div id="closed" class="closed"></div>
+    <div class="spend" id="spend"></div>
+  </aside>
+  <main class="main">
+    <header class="top">
+      <span class="crumb">Boards</span><span class="slash">/</span><span class="crumb strong" id="crumb-board">main</span>
+      <span class="seg" role="tablist" aria-label="View">
+        <button class="on" role="tab" aria-selected="true">Board</button>
+        <button disabled role="tab" title="Not in this version">List</button>
+        <button disabled role="tab" title="Not in this version">Timeline</button>
+      </span>
+      <span class="filters" id="filters"></span>
+      <button class="icon-btn" id="theme" aria-label="Switch theme"></button>
+    </header>
+    <section class="board" id="board" aria-label="Tasks by state"></section>
+    <footer class="strip" id="strip"></footer>
+  </main>
+  <aside class="panel" id="panel" hidden aria-label="Details"></aside>
+</div>
+<div class="gate" id="gate" hidden>
+  <div class="gate-card">
+    <span class="logo big" aria-hidden="true">c</span>
+    <h1 id="gate-title">Not signed in</h1>
+    <p id="gate-text">Run <code>cork inspect</code> to open the board.</p>
+  </div>
+</div>
+</body>
+</html>

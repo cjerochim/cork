@@ -46,8 +46,9 @@ No tags exist yet, and `Cargo.toml` has said `0.1.0` since Milestone 1. Mileston
 |---|---|---|
 | `0.1.0` | Milestones 1–3: the board, tasks and leases, `tasks run`, worker fleets and keyword routing, escalation and the lead skill, usage capture, `cork stats`, `/metrics` | 11, 16, 17, 18 |
 | `0.2.0` | Task dependencies and the "waiting on tasks" state | 6.8 |
-| `0.3.0` | Server mode with SQLite | 13 |
-| `0.4.0`+ | Grants, the web UI, MCP adapter, OpenTelemetry, in whatever order Chris picks | 13.3, 14, 18.5 |
+| `0.3.0` | The board view: a live read-only web UI, `cork inspect`, `GET /v1/stats` (moved ahead of server mode by Chris, 2026-11-28) | 20 |
+| `0.4.0` | Server mode with SQLite | 13 |
+| `0.5.0`+ | Grants, write actions in the web UI, MCP adapter, OpenTelemetry, in whatever order Chris picks | 13.3, 14, 18.5 |
 | `1.0.0` | The contracts in section 7 are frozen | |
 
 **Alternative:** tag the three old milestone merges as `v0.1.0`, `v0.2.0` and `v0.3.0`. This gives a tag per milestone, but those commits all say `0.1.0` in `Cargo.toml`, so a binary built from the `v0.3.0` tag would report itself as `0.1.0`. Retro tags would have to be source-only, with no binaries. That is why it is not the recommendation.

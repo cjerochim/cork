@@ -12,7 +12,7 @@ Read this file first. Then start at "Milestone 1".
 
 **Added 2026-11-28, planned, not built:** wildcard channel patterns, and several patterns in one selector (19). Signed off by Chris on 2026-11-28.
 
-**Added 2026-11-28, spec only, not built:** the board view, a live read-only web UI at `/ui/`: a column board with light and dark themes (20). Direction picked by Chris; open questions in 20.11.
+**Added 2026-11-28, built:** the board view, a live read-only web UI at `/ui/`, opened with `cork inspect`: a column board with light and dark themes (20). Direction and the four answers in 20.11 signed off by Chris on 2026-11-28.
 
 **Added 2026-11-27, planned, not built:** task dependencies and the `waiting` state, in the core (6.8). Signed off by Chris on 2026-11-27, including both decisions in 6.8.10.
 
@@ -1527,7 +1527,7 @@ With `--channel <name>` it answers the same question for a task that doesn't exi
 
 ## 20. The board view (a live web UI)
 
-**Status:** direction picked by Chris on 2026-11-28: a plain column board in the style of Linear, with a light theme (J) and a dark theme (K). This replaces the earlier 3D office direction. Spec only. Not built. The open questions are in 20.11.
+**Status:** direction picked by Chris on 2026-11-28: a plain column board in the style of Linear, with a light theme (J) and a dark theme (K). This replaces the earlier 3D office direction. Chris accepted all four answers in 20.11 and said go on 2026-11-28.
 
 The design canvas: [Cork directions](https://claude.ai/artifact/4ykkuP4WUcwo3mCjtsjuKh) (artboards J and K).
 
@@ -1606,14 +1606,14 @@ One page, two themes. They share everything except colours.
 - The files are built into the `cork` binary with `include_bytes!`: `index.html`, `app.css`, and a few small ES modules. There is no npm, no bundler and no build step.
 - It loads no web fonts and no third-party scripts, so it works offline. It uses the system font stack.
 - **Size budget:** under 60 KB compressed for everything.
-- **Headers:** `Content-Security-Policy: default-src 'self'; img-src 'self' data:; frame-ancestors 'none'`, plus `X-Content-Type-Options: nosniff`. File names carry a content hash, so they can be cached for good.
+- **Headers:** `Content-Security-Policy: default-src 'self'; img-src 'self' data:; frame-ancestors 'none'`, plus `X-Content-Type-Options: nosniff`. Each file is sent with an `ETag` (a hash of its bytes) and `Cache-Control: no-cache`, so the browser checks for a new version cheaply and never runs an old page against a newer daemon.
 - **Battery:** the page does nothing between events. Lease bars update once a second while a tab is visible.
 
 ### 20.6 Signing in
 
 The daemon token never reaches the browser (14.4). Instead:
 
-1. `cork inspect` (name: open question 1) calls `POST /v1/sessions` with the daemon token and `{"scope": "read"}`. The daemon returns a one-time code. The code works once and lasts 60 seconds.
+1. `cork inspect` calls `POST /v1/sessions` with the daemon token and `{"scope": "read"}`. The daemon returns a one-time code. The code works once and lasts 60 seconds.
 2. The CLI opens `http://127.0.0.1:<port>/ui/#code=<code>`. The code is in the fragment, which browsers never send to a server, so it can't end up in a log.
 3. The page sends the code to `POST /v1/sessions/redeem` with the header `X-Cork-UI: 1`. The daemon answers with a cookie: `HttpOnly`, `SameSite=Strict`, `Path=/v1`, lasting 12 hours.
 4. **A read session can only read.** Any `POST` that comes with only a cookie gets `forbidden`. The `Host` and `Origin` checks stay exactly as they are (10).
@@ -1625,10 +1625,9 @@ The daemon token never reaches the browser (14.4). Instead:
 
 Everything comes from routes that exist today, plus one optional route:
 
-- **Snapshot:** `/v1/whoami`, then `/v1/tasks` for every state, with `dependencies` and `dependents` (6.8.7).
-- **Live:** `/v1/events/stream?after=<lowest head>`, resuming with `Last-Event-ID` (14.2).
-- **Workers seen before the page opened:** the page reads today's `TaskClaimed` events and `usage=attempt` replies once at start (`/v1/events?type=…`), so pool counts are right from the first frame.
-- **Cost:** see open question 2.
+- **Start:** `/v1/whoami`, then the whole log through `/v1/events` in pages of 1,000, folded into the board. One fold gives tasks, titles, dependencies, workers and their pools at once, so there is no second model to keep in step with `/v1/tasks`. A board of 1,000 tasks (about 2,700 events) is live in about 0.3 s. A board far bigger than that may later want a snapshot to start from; the fold would not change.
+- **Live:** `/v1/events/stream?after=<head>`. The browser resumes with `Last-Event-ID` (14.2). If the stream closes for good, the page reopens it from its own head, and a position it has already folded is skipped, so there are no gaps and no repeats.
+- **Cost:** `GET /v1/stats?since=<start of today>`, which runs `cork-stats` on the server so the numbers match `cork stats` exactly. It is read-only and needs the same auth as `/v1/events`.
 
 ### 20.8 Not in this version
 
@@ -1641,8 +1640,9 @@ Everything comes from routes that exist today, plus one optional route:
 ### 20.9 Layout of the code
 
 - `crates/cork-server/ui/` holds the static files. A small `ui.rs` in `cork-server` serves them with the headers above.
-- The script is split into plain modules matching 20.2: `state.js` (the fold, with no DOM), `columns.js` (column rules), and `render.js` (the only module that touches the DOM).
-- `state.js` and `columns.js` are tested with Node's built-in test runner against recorded event logs. That needs no npm packages, and GitHub's runners already have Node.
+- The script is split into plain modules matching 20.2: `state.js` (the fold, with no DOM), `columns.js` (column rules), `render.js` (the only module that touches the DOM), and `main.js` (sign-in, loading, the stream, and the one function that changes view settings).
+- `state.js` and `columns.js` are tested with Node's built-in test runner (`node --test crates/cork-server/ui/test/fold.test.js`) against event logs recorded from dummy workers (`ui/test/record-fixture.sh`). That needs no npm packages, and GitHub's runners already have Node.
+- `scripts/demo-board.sh` fills a board with dummy tasks and workers for trying the page. Nothing in it runs an agent or costs money.
 
 ### 20.10 Done when
 
@@ -1653,9 +1653,12 @@ Everything comes from routes that exist today, plus one optional route:
 5. The files add under 60 KB compressed to the binary. `cargo build` needs nothing beyond Rust.
 6. Light and dark both match artboards J and K closely enough that Chris signs them off.
 
-### 20.11 Open questions for Chris
+### 20.11 Decisions
 
-1. **Command name.** `cork inspect` (my pick, since it says what you do with it) or `cork ui`?
-2. **Cost numbers.** Add `GET /v1/stats?since=`, which reuses `cork-stats` so the numbers match `cork stats` exactly (my pick), or have the page add up the usage replies itself?
-3. **Done column.** Show today's completed tasks only (my pick), or the newest N whatever their age?
-4. **Release.** Ship it as `0.3.0` and move server mode to `0.4.0` (docs/releasing.md 2), or keep the plan and ship it in `0.4.0`?
+Chris accepted all four on 2026-11-28.
+
+1. **Command name:** `cork inspect`.
+2. **Cost numbers:** a new route, `GET /v1/stats?since=`, reusing `cork-stats`, so the page and `cork stats` always agree.
+3. **Done column:** today's completed tasks only (local midnight in the browser).
+4. **Release:** the board ships as `0.3.0`. Server mode moves to `0.4.0` (docs/releasing.md 2).
+
