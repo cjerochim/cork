@@ -14,15 +14,22 @@ async fn a_wait_wakes_for_a_new_matching_channel() {
     let c = d.client("lead");
     let waiter = {
         let c = c.clone();
-        tokio::spawn(async move { c.get("/events?channel=work/*/tests&wait_ms=5000").await.ok() })
+        tokio::spawn(async move {
+            c.get("/events?channel=work/*/tests&wait_ms=5000")
+                .await
+                .ok()
+        })
     };
     tokio::time::sleep(Duration::from_millis(200)).await;
     c.post("/channels/work%2Ftests/messages", json!({ "text": "no" }))
         .await
         .ok();
-    c.post("/channels/work%2Fapi%2Ftests/messages", json!({ "text": "yes" }))
-        .await
-        .ok();
+    c.post(
+        "/channels/work%2Fapi%2Ftests/messages",
+        json!({ "text": "yes" }),
+    )
+    .await
+    .ok();
     let r = waiter.await.unwrap();
     let events = r["events"].as_array().unwrap();
     assert_eq!(events.len(), 1, "{r}");
@@ -62,8 +69,8 @@ async fn a_stream_takes_patterns() {
             &format!("/channels/{}/messages", ch.replace('/', "%2F")),
             json!({ "text": ch }),
         )
-            .await
-            .ok();
+        .await
+        .ok();
     }
     let mut buf = String::new();
     let mut ids = vec![];

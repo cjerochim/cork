@@ -89,7 +89,10 @@ pub enum Shape<'a> {
     /// Anything else. `prefix` is the literal segments before the first
     /// wildcard, joined by `/` (empty if it starts with one); every match is
     /// that channel or under it.
-    Wild { prefix: String, pattern: &'a Pattern },
+    Wild {
+        prefix: String,
+        pattern: &'a Pattern,
+    },
 }
 
 impl Pattern {
@@ -194,7 +197,11 @@ impl std::fmt::Display for Pattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let n = self.segs.len();
         let subtree = n > 1 && self.segs[n - 1] == Segment::Many;
-        let shown = if subtree { &self.segs[..n - 1] } else { &self.segs[..] };
+        let shown = if subtree {
+            &self.segs[..n - 1]
+        } else {
+            &self.segs[..]
+        };
         let parts: Vec<&str> = shown
             .iter()
             .map(|s| match s {
@@ -310,14 +317,6 @@ impl ChannelSelector {
         &self.exclude
     }
 
-    /// True if any pattern has a wildcard or an exclusion is present: the
-    /// selector is more than the `work` / `work/` of Milestone 1.
-    pub fn is_plain(&self) -> bool {
-        self.exclude.is_empty()
-            && self.include.len() == 1
-            && matches!(self.include[0].shape(), Shape::Exact(_) | Shape::Subtree(_))
-    }
-
     /// Could this selector match `root` or a channel under it? Used to keep
     /// worker pools off `features/` (HANDOFF 19.6). It errs on the side of
     /// yes: a pattern that can reach under `root` counts unless an exclusion
@@ -362,7 +361,7 @@ fn reaches(pat: &[Segment], root: &[&str]) -> bool {
 /// Does `pat` match every channel that is `root` or under it?
 fn covers_subtree(pat: &[Segment], root: &[&str]) -> bool {
     match (pat.split_first(), root.split_first()) {
-        (Some((Segment::Many, rest)), _) if rest.is_empty() => true,
+        (Some((Segment::Many, [])), _) => true,
         (Some((Segment::One, rest)), Some((_, r))) => covers_subtree(rest, r),
         (Some((Segment::Lit(l), rest)), Some((c, r))) => l == c && covers_subtree(rest, r),
         _ => false,
@@ -433,7 +432,11 @@ mod tests {
     fn pattern_table() {
         let rows: &[(&str, &[&str], &[&str])] = &[
             ("work", &["work"], &["work/fix", "workshop"]),
-            ("work/*", &["work/fix", "work/docs"], &["work", "work/fix/tests"]),
+            (
+                "work/*",
+                &["work/fix", "work/docs"],
+                &["work", "work/fix/tests"],
+            ),
             (
                 "work/*/tests",
                 &["work/api/tests", "work/cli/tests"],
@@ -451,7 +454,11 @@ mod tests {
             ),
             ("**", &["a", "work/fix", "a/b/c/d/e/f/g/h"], &[]),
             ("*", &["work", "docs"], &["work/fix"]),
-            ("work/**/tests", &["work/tests", "work/a/b/tests"], &["work/a/tests/x"]),
+            (
+                "work/**/tests",
+                &["work/tests", "work/a/b/tests"],
+                &["work/a/tests/x"],
+            ),
             ("*/**", &["a", "a/b"], &[]),
             ("**/**/x", &["x", "a/x"], &["a"]),
         ];
@@ -478,7 +485,10 @@ mod tests {
             sel("work/").includes()[0].shape(),
             Shape::Subtree("work".into())
         );
-        assert_eq!(sel("work").includes()[0].shape(), Shape::Exact("work".into()));
+        assert_eq!(
+            sel("work").includes()[0].shape(),
+            Shape::Exact("work".into())
+        );
         assert_eq!(sel("**").includes()[0].shape(), Shape::All);
         assert!(matches!(
             sel("work/*/tests").includes()[0].shape(),
@@ -510,7 +520,10 @@ mod tests {
         assert!(!x.matches("features"));
         assert!(!x.matches("features/a/b"));
         assert!(x.matches("featuresx"));
-        assert_eq!(x.excluded_by("features/a").unwrap().to_string(), "features/");
+        assert_eq!(
+            x.excluded_by("features/a").unwrap().to_string(),
+            "features/"
+        );
         assert_eq!(x.to_param(), "**,!features/");
         assert_eq!(sel("!features/,**"), x);
 
@@ -539,7 +552,10 @@ mod tests {
             "a/b/c/d/e/f/g/h/i",
             "!",
         ] {
-            assert!(ChannelSelector::parse(bad).is_err(), "`{bad}` should be refused");
+            assert!(
+                ChannelSelector::parse(bad).is_err(),
+                "`{bad}` should be refused"
+            );
         }
         // 8 fixed segments plus a trailing `**` is fine.
         assert!(ChannelSelector::parse("a/b/c/d/e/f/g/h/").is_ok());

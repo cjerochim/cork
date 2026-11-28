@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use cork_core::channel::Shape;
 use cork_core::labels::{MENTION_LABEL, TASK_LABEL};
 use cork_core::{
-    BoardError, ChannelSelector, Pattern, ErrorCode, Message, Millis, Result, Task, TaskState, task_stream,
-    thread_stream,
+    BoardError, ChannelSelector, ErrorCode, Message, Millis, Pattern, Result, Task, TaskState,
+    task_stream, thread_stream,
 };
 use cork_store::*;
 use rusqlite::types::Value;
@@ -420,9 +420,13 @@ fn register_functions(c: &Connection) -> Result<()> {
         2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let pat = ctx.get_or_create_aux(0, |v| -> std::result::Result<Pattern, BoardError> {
-                Pattern::parse(v.as_str().map_err(|e| BoardError::internal(e.to_string()))?)
-            })?;
+            let pat =
+                ctx.get_or_create_aux(0, |v| -> std::result::Result<Pattern, BoardError> {
+                    Pattern::parse(
+                        v.as_str()
+                            .map_err(|e| BoardError::internal(e.to_string()))?,
+                    )
+                })?;
             Ok(match ctx.get_raw(1).as_str_or_null() {
                 Ok(Some(ch)) => pat.matches(ch),
                 _ => false,

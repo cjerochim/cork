@@ -114,7 +114,14 @@ async fn a_database_from_before_patterns_learns_its_channels_on_open() {
     let path = dir.path().join("b.db");
     let t = {
         let s = SqliteStore::open(SqliteConfig::new(&path)).await.unwrap();
-        create_task(&s, "work/api/tests", Labels::new(), CreateTask::default(), 1).await
+        create_task(
+            &s,
+            "work/api/tests",
+            Labels::new(),
+            CreateTask::default(),
+            1,
+        )
+        .await
     };
     // Make it look like a database written before `known_channels` existed.
     {

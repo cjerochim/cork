@@ -1528,7 +1528,7 @@ pub async fn dependency_projection<S: Store>(s: Arc<S>) {
 /// with any number.
 pub struct Lcg(pub u64);
 impl Lcg {
-    pub fn next(&mut self) -> u64 {
+    pub fn draw(&mut self) -> u64 {
         self.0 = self
             .0
             .wrapping_mul(6364136223846793005)
@@ -1536,12 +1536,12 @@ impl Lcg {
         self.0 >> 33
     }
     pub fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
-        xs[(self.next() as usize) % xs.len()]
+        xs[(self.draw() as usize) % xs.len()]
     }
 }
 
 fn random_channel(r: &mut Lcg) -> String {
-    let depth = 1 + (r.next() % 4) as usize;
+    let depth = 1 + (r.draw() % 4) as usize;
     (0..depth)
         .map(|_| r.pick(&["a", "b", "tests", "x_y", "features"]))
         .collect::<Vec<_>>()
@@ -1549,12 +1549,12 @@ fn random_channel(r: &mut Lcg) -> String {
 }
 
 fn random_pattern(r: &mut Lcg) -> String {
-    let depth = 1 + (r.next() % 3) as usize;
+    let depth = 1 + (r.draw() % 3) as usize;
     let mut p = (0..depth)
         .map(|_| r.pick(&["a", "b", "tests", "x_y", "*", "**", "features"]))
         .collect::<Vec<_>>()
         .join("/");
-    if r.next() % 4 == 0 {
+    if r.draw().is_multiple_of(4) {
         p.push('/');
     }
     p
@@ -1562,9 +1562,9 @@ fn random_pattern(r: &mut Lcg) -> String {
 
 /// A random selector: one to three patterns, sometimes an exclusion.
 pub fn random_selector(r: &mut Lcg) -> ChannelSelector {
-    let n = 1 + (r.next() % 3) as usize;
+    let n = 1 + (r.draw() % 3) as usize;
     let mut parts: Vec<String> = (0..n).map(|_| random_pattern(r)).collect();
-    if r.next() % 3 == 0 {
+    if r.draw().is_multiple_of(3) {
         parts.push(format!("!{}", random_pattern(r)));
     }
     ChannelSelector::parse_all(&parts).unwrap()
@@ -1699,7 +1699,10 @@ pub async fn channel_patterns_match_core<S: Store>(s: Arc<S>) {
             .collect();
         assert_eq!(got, want, "messages for {sel}");
     }
-    assert!(partial > 40, "the random selectors should mostly match some tasks, got {partial}");
+    assert!(
+        partial > 40,
+        "the random selectors should mostly match some tasks, got {partial}"
+    );
 }
 
 /// A pattern read sees a channel made after an earlier read of the same

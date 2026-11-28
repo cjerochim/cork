@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod deps;
 pub mod invariants;
 pub mod lead;
+pub mod patterns;
 pub mod scenarios;
 pub mod stats;
 

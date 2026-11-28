@@ -435,7 +435,7 @@ fn patterns_on_the_command_line() {
             .collect()
     };
     assert_eq!(ids("work/*/tests,docs/"), [a.clone(), c.clone()]);
-    assert_eq!(ids("**,!work/"), [c.clone()]);
+    assert_eq!(ids("**,!work/"), [c]);
     let page = e.json(&["read", "work/*/tests"]);
     assert_eq!(page["messages"].as_array().unwrap().len(), 1);
     assert_eq!(
