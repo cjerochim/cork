@@ -12,6 +12,8 @@ Read this file first. Then start at "Milestone 1".
 
 **Added 2026-11-28, planned, not built:** wildcard channel patterns, and several patterns in one selector (19). Signed off by Chris on 2026-11-28.
 
+**Added 2026-11-28, built:** the board view, a live read-only web UI at `/ui/`, opened with `cork inspect`: a column board with light and dark themes (20). Direction and the four answers in 20.11 signed off by Chris on 2026-11-28.
+
 **Added 2026-11-27, planned, not built:** task dependencies and the `waiting` state, in the core (6.8). Signed off by Chris on 2026-11-27, including both decisions in 6.8.10.
 
 ---
@@ -1522,3 +1524,141 @@ With `--channel <name>` it answers the same question for a task that doesn't exi
 4. `cork-stress` runs with pattern selectors and its invariants still hold. It reports the read and claim latency against plain selectors.
 5. `workers up` refuses a non-lead pool that can match `features/`. `status` reports overlaps. `match` names the matching pattern.
 6. Every selector from Milestones 1 to 3 behaves exactly as before.
+
+## 20. The board view (a live web UI)
+
+**Status:** direction picked by Chris on 2026-11-28: a plain column board in the style of Linear, with a light theme (J) and a dark theme (K). This replaces the earlier 3D office direction. Chris accepted all four answers in 20.11 and said go on 2026-11-28.
+
+The design canvas: [Cork directions](https://claude.ai/artifact/4ykkuP4WUcwo3mCjtsjuKh) (artboards J and K).
+
+| Light (J) | Dark (K) |
+| --- | --- |
+| ![The board, light](docs/images/board-light.webp) | ![The board, dark](docs/images/board-dark.webp) |
+
+This section adds a read-only web page that shows one board as columns of task cards, updated live as events arrive. It fills the first part of section 14. It reads only through the public API, writes nothing, and comes before server mode (13). It is plain HTML, CSS and JavaScript: no 3D, no framework, no build step.
+
+### 20.1 What you see
+
+A sidebar on the left, a top bar, the columns, and a one-line event strip along the bottom.
+
+**Columns.** One column for each open state, in the order work flows:
+
+| Column | State | Order |
+| --- | --- | --- |
+| Waiting on tasks | `waiting` | Oldest first |
+| Ready | `ready` | Oldest first, the order claims take them (FIFO) |
+| In progress | `claimed` | Longest held first |
+| Needs you | `blocked` | Oldest first, shown in red |
+| Done | `completed` | Newest first. The newest few are shown, then "+ N more" |
+
+`failed` and `canceled` are folded into the sidebar under **Closed**, with a count each. Clicking one opens it as a list.
+
+**A card shows:**
+
+- The task id and title, with a state icon (dashed ring, ring, half-filled ring, red alert, check, cross, dash).
+- The channel as a chip, with a dot in the pool's colour.
+- The worker holding the claim, as a small avatar coloured by pool. An empty dashed circle means nobody holds it.
+- What it waits on ("waits on T-3B, T-3D") or a met dependency ("T-3A done").
+- Cost so far, from its `usage=attempt` replies.
+- **In progress only:** a thin lease bar, filled by `TaskClaimed` and `LeaseRenewed` and measured against the server's `now`. The page never decides on its own that a lease has ended. Only a `LeaseExpired` event moves the card (14.1).
+- **Needs you only:** the question from `TaskBlocked`, who asked and when. The Answer and Reassign buttons are drawn but disabled in this version (20.8).
+
+A task that has been replaced (`replaces`) shows a small "retried as T-x" link instead of standing on its own.
+
+**Sidebar:** board name and live dot; Board, Events, Workers and Cost pages; each pool with how many of its workers are busy ("2/3 busy"); Closed counts; today's spend and the cost per finished task.
+
+**Top bar:** the board name, a Board, List or Timeline switch (only Board in this version), filters for pool and channel, "Hide done", and the theme button.
+
+**Event strip:** the last two events in plain words ("rust-2 completed Trim export memory"), with their positions, and the daemon address and head position on the right.
+
+- **Workers** are the profiles seen in claims (`TaskClaimed.data.profile`). Their pool and model come from the `pool` and `model` fields of their `usage=attempt` replies (18). Until a worker posts usage, it shows as "pool unknown". Nothing is guessed from the profile name.
+
+### 20.2 Declarative from end to end
+
+The page never edits the screen by hand. It follows three steps, and each one depends only on the step before:
+
+1. **State** is a fold of the event log: snapshot, then stream (14.1). It is the same fold any future view would use.
+2. **Columns** are declared: which state each column holds, how it sorts, and how many cards it shows before "+ N more".
+3. **Render** turns columns into HTML. When an event arrives, the fold changes, the affected columns re-render, and a card that changed column slides to its new place. The animation is only in-between frames. It never changes what the state says.
+
+The same state always draws the same page. That makes it testable without a browser: feed it events, then check which column each card is in and in what order.
+
+### 20.3 Light and dark
+
+One page, two themes. They share everything except colours.
+
+- **Light (J):** off-white background, white cards, a light grey sidebar.
+- **Dark (K):** near-black background, dark grey cards, a darker sidebar.
+- The theme follows the operating system's light or dark setting. The button switches it, and the choice is remembered in the browser (`localStorage`).
+- Colours are CSS variables, so a theme is one block of variables and nothing else.
+
+### 20.4 Interaction
+
+- Clicking a card opens a side panel: state, worker, lease, dependencies both ways, cost, and the task's event history. Esc closes it.
+- Hovering a card highlights the cards it waits on and the cards waiting on it.
+- Clicking a pool in the sidebar filters the columns to that pool. Clicking it again clears the filter.
+- Clicking a Closed count lists those tasks in the side panel.
+- The keyboard works throughout: Tab moves between cards, Enter opens one.
+
+### 20.5 How it is served
+
+- `cork serve` serves the page at `/ui/`. That path is already reserved (14.4, 13.1), so the page has the daemon's own origin and needs no CORS.
+- The files are built into the `cork` binary with `include_bytes!`: `index.html`, `app.css`, and a few small ES modules. There is no npm, no bundler and no build step.
+- It loads no web fonts and no third-party scripts, so it works offline. It uses the system font stack.
+- **Size budget:** under 60 KB compressed for everything.
+- **Headers:** `Content-Security-Policy: default-src 'self'; img-src 'self' data:; frame-ancestors 'none'`, plus `X-Content-Type-Options: nosniff`. Each file is sent with an `ETag` (a hash of its bytes) and `Cache-Control: no-cache`, so the browser checks for a new version cheaply and never runs an old page against a newer daemon.
+- **Battery:** the page does nothing between events. Lease bars update once a second while a tab is visible.
+
+### 20.6 Signing in
+
+The daemon token never reaches the browser (14.4). Instead:
+
+1. `cork inspect` calls `POST /v1/sessions` with the daemon token and `{"scope": "read"}`. The daemon returns a one-time code. The code works once and lasts 60 seconds.
+2. The CLI opens `http://127.0.0.1:<port>/ui/#code=<code>`. The code is in the fragment, which browsers never send to a server, so it can't end up in a log.
+3. The page sends the code to `POST /v1/sessions/redeem` with the header `X-Cork-UI: 1`. The daemon answers with a cookie: `HttpOnly`, `SameSite=Strict`, `Path=/v1`, lasting 12 hours.
+4. **A read session can only read.** Any `POST` that comes with only a cookie gets `forbidden`. The `Host` and `Origin` checks stay exactly as they are (10).
+5. Sessions are kept in memory. Restarting the daemon or running `cork token rotate` ends all of them, and the page asks you to run `cork inspect` again.
+
+`POST /v1/sessions` and `/redeem` are new routes, added under 7.6's additive-only rule. Server mode later swaps step 1 for OIDC sign-in (14.4). Nothing else changes.
+
+### 20.7 Data it reads
+
+Everything comes from routes that exist today, plus one optional route:
+
+- **Start:** `/v1/whoami`, then the whole log through `/v1/events` in pages of 1,000, folded into the board. One fold gives tasks, titles, dependencies, workers and their pools at once, so there is no second model to keep in step with `/v1/tasks`. A board of 1,000 tasks (about 2,700 events) is live in about 0.3 s. A board far bigger than that may later want a snapshot to start from; the fold would not change.
+- **Live:** `/v1/events/stream?after=<head>`. The browser resumes with `Last-Event-ID` (14.2). If the stream closes for good, the page reopens it from its own head, and a position it has already folded is skipped, so there are no gaps and no repeats.
+- **Cost:** `GET /v1/stats?since=<start of today>`, which runs `cork-stats` on the server so the numbers match `cork stats` exactly. It is read-only and needs the same auth as `/v1/events`.
+
+### 20.8 Not in this version
+
+- Buttons that change anything: answer, reassign, unblock, cancel, reopen. They are drawn disabled. They come later through the normal routes with a write session (14.3).
+- The List and Timeline views. The switch is there; only Board works.
+- Dragging cards between columns. State changes only come from events.
+- Phones. The page should load on a phone and scroll its columns sideways, but it is designed for a laptop screen.
+- More than one board, and server mode.
+
+### 20.9 Layout of the code
+
+- `crates/cork-server/ui/` holds the static files. A small `ui.rs` in `cork-server` serves them with the headers above.
+- The script is split into plain modules matching 20.2: `state.js` (the fold, with no DOM), `columns.js` (column rules), `render.js` (the only module that touches the DOM), and `main.js` (sign-in, loading, the stream, and the one function that changes view settings).
+- `state.js` and `columns.js` are tested with Node's built-in test runner (`node --test crates/cork-server/ui/test/fold.test.js`) against event logs recorded from dummy workers (`ui/test/record-fixture.sh`). That needs no npm packages, and GitHub's runners already have Node.
+- `scripts/demo-board.sh` fills a board with dummy tasks and workers for trying the page. Nothing in it runs an agent or costs money.
+
+### 20.10 Done when
+
+1. `cork inspect` opens the page, signed in, and it shows a live board within one second on a board of 1,000 tasks.
+2. Every event type in 6.3 has a fold test, and the fold matches `GET /v1/tasks` after replaying a recorded `cork-stress` log.
+3. Opening the page with no session, with an expired code, or from another origin fails safely. A `POST` with only the cookie gets `forbidden`.
+4. Killing and restarting the stream mid-run leaves no gaps and no repeats (14.1 step 3).
+5. The files add under 60 KB compressed to the binary. `cargo build` needs nothing beyond Rust.
+6. Light and dark both match artboards J and K closely enough that Chris signs them off.
+
+### 20.11 Decisions
+
+Chris accepted all four on 2026-11-28.
+
+1. **Command name:** `cork inspect`.
+2. **Cost numbers:** a new route, `GET /v1/stats?since=`, reusing `cork-stats`, so the page and `cork stats` always agree.
+3. **Done column:** today's completed tasks only (local midnight in the browser).
+4. **Release:** the board ships as `0.3.0`. Server mode moves to `0.4.0` (docs/releasing.md 2).
+

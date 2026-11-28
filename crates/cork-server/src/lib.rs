@@ -10,6 +10,7 @@ pub mod board;
 pub mod clock;
 pub mod http;
 pub mod metrics;
+pub mod ui;
 
 pub use auth::{Authenticator, LocalToken};
 

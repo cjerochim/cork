@@ -411,6 +411,42 @@ pub fn parse_state(s: &str) -> cork_core::Result<TaskState> {
     TaskState::parse(s)
 }
 
+/// The header the board page sends with `POST /v1/sessions/redeem` (20.6).
+/// A plain form or link cannot set it, so a cross-site page cannot redeem.
+pub const HEADER_UI: &str = "x-cork-ui";
+/// The cookie that carries a read session (20.6).
+pub const SESSION_COOKIE: &str = "cork_session";
+
+/// `POST /v1/sessions`: ask for a one-time sign-in code for the web page.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SessionReq {
+    /// Only `read` in this version.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// A one-time code. It works once, within `expires_in_ms`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionCode {
+    pub code: String,
+    pub expires_in_ms: u64,
+}
+
+/// `POST /v1/sessions/redeem`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RedeemReq {
+    #[serde(default)]
+    pub code: String,
+}
+
+/// The answer to a redeem; the session itself is in the cookie.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionOut {
+    pub person: String,
+    pub scope: String,
+    pub expires_in_ms: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

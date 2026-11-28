@@ -345,6 +345,7 @@ dependencies = [
  "axum-extra",
  "cork-api",
  "cork-core",
+ "cork-stats",
  "cork-store",
  "cork-store-sqlite",
  "futures",

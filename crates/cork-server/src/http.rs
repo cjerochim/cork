@@ -62,6 +62,8 @@ pub struct App<S: Store> {
     pub board: Arc<Board<S>>,
     pub auth: Arc<dyn Authenticator>,
     pub hosts: HostPolicy,
+    /// Read sessions for the board page (20.6). In memory only.
+    pub sessions: crate::ui::Sessions,
 }
 
 type AppState<S> = Arc<App<S>>;
@@ -122,6 +124,9 @@ pub fn router<S: Store>(app: AppState<S>) -> Router {
         .route("/tasks/{id}/history", get(history::<S>))
         .route("/tasks/{id}/{op}", post(settle::<S>))
         .route("/export", get(export::<S>))
+        .route("/stats", get(stats::<S>))
+        .route("/sessions", post(create_session::<S>))
+        .route("/sessions/redeem", post(redeem::<S>))
         .layer(middleware::from_fn_with_state(app.clone(), guard::<S>))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY));
     // `/metrics` sits at the root, where Prometheus looks, behind the same
@@ -129,15 +134,24 @@ pub fn router<S: Store>(app: AppState<S>) -> Router {
     let metrics = Router::new()
         .route("/metrics", get(metrics::<S>))
         .layer(middleware::from_fn_with_state(app.clone(), guard::<S>));
+    // The board page (20.5): static files, Host-checked, no token.
+    let ui = Router::new()
+        .route("/ui", get(crate::ui::to_slash))
+        .route("/ui/", get(crate::ui::index))
+        .route("/ui/{file}", get(crate::ui::asset))
+        .layer(middleware::from_fn_with_state(app.clone(), guard::<S>));
     Router::new()
         .nest(PREFIX, v1)
         .merge(metrics)
+        .merge(ui)
         .fallback(|| async { err(ErrorCode::NotFound, "no such route") })
         .with_state(app)
 }
 
-/// Host check, Origin check, then the token (10). `/health` and `/ready`
-/// need no token but still get the Host check.
+/// Host check, Origin check, then the token (10). `/health`, `/ready`, the
+/// sign-in redeem and the page's static files need no token but still get
+/// the Host check. Without a token, a read session cookie (20.6) is
+/// accepted for `GET` only.
 async fn guard<S: Store>(State(app): State<AppState<S>>, mut req: Request, next: Next) -> Response {
     let headers = req.headers();
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
@@ -160,17 +174,45 @@ async fn guard<S: Store>(State(app): State<AppState<S>>, mut req: Request, next:
         }
     }
     let path = req.uri().path();
-    if path.ends_with("/health") || path.ends_with("/ready") {
+    let open = path.ends_with("/health")
+        || path.ends_with("/ready")
+        || matches!(path, "/v1/sessions/redeem" | "/sessions/redeem")
+        || path == "/ui"
+        || path.starts_with("/ui/");
+    if open {
         return next.run(req).await;
     }
-    let person = match app.auth.authenticate(headers) {
-        Ok(p) => p,
-        Err(e) => return ApiErr(e).into_response(),
+    let session = match crate::auth::bearer(headers) {
+        Some(_) => None,
+        None => crate::ui::cookie(headers, SESSION_COOKIE),
     };
-    let profile = headers
-        .get(HEADER_PROFILE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let (person, profile) = match session {
+        Some(id) => {
+            if !matches!(*req.method(), Method::GET | Method::HEAD) {
+                return err(ErrorCode::Forbidden, "a read session can only read").into_response();
+            }
+            match app.sessions.check(id, &app.auth.epoch()) {
+                Some(p) => (p, None),
+                None => {
+                    return err(
+                        ErrorCode::Unauthorized,
+                        "the session has ended: run `cork inspect` again",
+                    )
+                    .into_response();
+                }
+            }
+        }
+        None => match app.auth.authenticate(headers) {
+            Ok(p) => (
+                p,
+                headers
+                    .get(HEADER_PROFILE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+            ),
+            Err(e) => return ApiErr(e).into_response(),
+        },
+    };
     let actor = match Actor::new(person, profile) {
         Ok(a) => a,
         Err(e) => return ApiErr(e).into_response(),
@@ -633,6 +675,111 @@ async fn settle<S: Store>(
 }
 
 /// The whole log as JSONL, one envelope per line, in position order (13.4).
+// ---------- board view (20) ----------
+
+#[derive(Deserialize, Default)]
+struct StatsQ {
+    /// Only tasks created at or after this time (ms).
+    since: Option<i64>,
+    /// `pool` (the default), `model`, `profile`, `channel`, `day` or `label:<key>`.
+    by: Option<String>,
+}
+
+/// `cork stats` as JSON, on the server, so the page shows the same numbers
+/// (20.7). It replays the whole log, like `cork stats` does.
+async fn stats<S: Store>(
+    State(app): State<AppState<S>>,
+    Query(q): Query<StatsQ>,
+) -> ApiResult<Response> {
+    let by: cork_stats::By =
+        q.by.as_deref()
+            .unwrap_or("pool")
+            .parse()
+            .map_err(|e: String| err(ErrorCode::InvalidInput, e))?;
+    let board = &app.board;
+    let head = board.head().await?;
+    let mut events = vec![];
+    let mut after = 0;
+    while after < head {
+        let page = board.export_page(after).await?;
+        let Some(last) = page.last() else { break };
+        after = last.position;
+        events.extend(page.iter().filter(|e| e.position <= head).map(event_out));
+    }
+    let opts = cork_stats::Options {
+        by: Some(by),
+        since: q.since,
+        ..Default::default()
+    };
+    let report = tokio::task::spawn_blocking(move || cork_stats::report(&events, &opts))
+        .await
+        .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+    Ok(with_head(head, report))
+}
+
+/// A one-time sign-in code for the board page (20.6). Needs the token: a
+/// cookie cannot get here, since the guard refuses a `POST` with only a
+/// cookie.
+async fn create_session<S: Store>(
+    State(app): State<AppState<S>>,
+    Extension(c): Extension<Caller>,
+    b: Bytes,
+) -> ApiResult<Json<SessionCode>> {
+    let req: SessionReq = body(&b)?;
+    match req.scope.as_deref() {
+        None | Some("read") => {}
+        Some(s) => {
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("scope `{s}` is not offered: only `read`"),
+            ));
+        }
+    }
+    let code = app
+        .sessions
+        .issue(&c.actor.person, &app.auth.epoch())
+        .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+    Ok(Json(SessionCode {
+        code,
+        expires_in_ms: crate::ui::CODE_TTL.as_millis() as u64,
+    }))
+}
+
+/// Trade a code for the session cookie. The `X-Cork-UI` header proves the
+/// request came from script on an allowed origin, not a form or a link.
+async fn redeem<S: Store>(
+    State(app): State<AppState<S>>,
+    headers: HeaderMap,
+    b: Bytes,
+) -> ApiResult<Response> {
+    if headers.get(HEADER_UI).and_then(|v| v.to_str().ok()) != Some("1") {
+        return Err(err(ErrorCode::Forbidden, "missing the X-Cork-UI header"));
+    }
+    let req: RedeemReq = body(&b)?;
+    let (id, person) = app
+        .sessions
+        .redeem(req.code.trim(), &app.auth.epoch())
+        .ok_or_else(|| {
+            err(
+                ErrorCode::Unauthorized,
+                "that sign-in code is used up or has expired: run `cork inspect` again",
+            )
+        })?;
+    let mut r = Json(SessionOut {
+        person,
+        scope: "read".into(),
+        expires_in_ms: crate::ui::SESSION_TTL.as_millis() as u64,
+    })
+    .into_response();
+    r.headers_mut().insert(
+        header::SET_COOKIE,
+        crate::ui::set_cookie(SESSION_COOKIE, &id),
+    );
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(r)
+}
+
 async fn export<S: Store>(State(app): State<AppState<S>>) -> ApiResult<Response> {
     let board = app.board.clone();
     let head = board.head().await?;

@@ -60,6 +60,7 @@ impl Daemon {
             board: board.clone(),
             auth: Arc::new(LocalToken::new(TOKEN, "stress")),
             hosts: HostPolicy::loopback(port),
+            sessions: Default::default(),
         });
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {

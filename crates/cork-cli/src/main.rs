@@ -61,6 +61,12 @@ enum Cmd {
     },
     /// Show who the daemon thinks you are.
     Whoami,
+    /// Open the live board in your browser, signed in for reading (20).
+    Inspect {
+        /// Print the sign-in link instead of opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// List channels.
     Channels,
     /// Start a thread in a channel.
@@ -705,6 +711,24 @@ async fn main_inner(cli: Cli) -> Result<i32, ClientError> {
         } => {
             let l = workers::load(&home, files.models.as_deref(), files.config.as_deref())?;
             return workers::matches(&l, Some(&client), Some(&id), &[], None, json).await;
+        }
+        Cmd::Inspect { no_open } => {
+            let c: cork_api::SessionCode = serde_json::from_value(
+                client
+                    .post("/sessions", &serde_json::json!({"scope": "read"}), None)
+                    .await?,
+            )
+            .map_err(internal)?;
+            let url = format!("{}/ui/#code={}", client.origin(), c.code);
+            let opened = !no_open && open_browser(&url);
+            if json {
+                print_json(&serde_json::json!({"url": url, "opened": opened}));
+            } else if opened {
+                println!("opened the board; the link works once, within a minute");
+            } else {
+                println!("{url}");
+                eprintln!("open that link within a minute; it works once");
+            }
         }
         Cmd::Whoami => {
             let w = client.whoami().await?;
@@ -1533,4 +1557,20 @@ fn print_event(e: &EventOut, json: bool) {
         "{}\t{}\t{}\t{ch}\t{what}",
         e.position, e.event_type, e.actor
     );
+}
+
+/// Open `url` with the system browser. False if there is none to run.
+fn open_browser(url: &str) -> bool {
+    let cmd = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(cmd)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }

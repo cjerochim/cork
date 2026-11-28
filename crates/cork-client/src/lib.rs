@@ -109,6 +109,11 @@ impl Client {
         self.profile.as_deref()
     }
 
+    /// The daemon's base address, without the `/v1` prefix.
+    pub fn origin(&self) -> &str {
+        self.base.strip_suffix(PREFIX).unwrap_or(&self.base)
+    }
+
     async fn call(
         &self,
         m: reqwest::Method,
