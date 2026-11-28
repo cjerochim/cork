@@ -48,6 +48,8 @@ macro_rules! contract_tests {
             task_events_match_task_labels,
             import_keeps_positions,
             dependency_projection,
+            channel_patterns_match_core,
+            known_channels_include_new_ones,
         );
     };
     (@each $make:expr; $($name:ident),* $(,)?) => {
@@ -558,7 +560,7 @@ pub async fn read_filters<S: Store>(s: Arc<S>) {
                 .collect::<Vec<_>>()
         }
     };
-    let sub = |p: &str| Some(ChannelSelector::Subtree(p.into()));
+    let sub = |p: &str| Some(ChannelSelector::subtree(p).unwrap());
     assert_eq!(
         q(EventFilter {
             channel: sub("work"),
@@ -578,7 +580,7 @@ pub async fn read_filters<S: Store>(s: Arc<S>) {
     );
     assert_eq!(
         q(EventFilter {
-            channel: Some(ChannelSelector::Exact("work".into())),
+            channel: Some(ChannelSelector::exact("work").unwrap()),
             ..Default::default()
         })
         .await,
@@ -810,7 +812,7 @@ pub async fn message_projection<S: Store>(s: Arc<S>) {
     );
     assert!(thread[0].position < thread[1].position);
     let roots = list(MessageQuery {
-        channel: Some(ChannelSelector::Subtree("work".into())),
+        channel: Some(ChannelSelector::subtree("work").unwrap()),
         roots_only: true,
         ..Default::default()
     })
@@ -1087,7 +1089,7 @@ pub async fn ready_queue_order_and_filters<S: Store>(s: Arc<S>) {
                 .collect::<Vec<_>>()
         }
     };
-    let sub = |p: &str| Some(ChannelSelector::Subtree(p.into()));
+    let sub = |p: &str| Some(ChannelSelector::subtree(p).unwrap());
     assert_eq!(
         ready(TaskQuery {
             now: 20,
@@ -1139,7 +1141,7 @@ pub async fn ready_queue_order_and_filters<S: Store>(s: Arc<S>) {
     assert_eq!(
         ready(TaskQuery {
             now: 2_000,
-            channel: Some(ChannelSelector::Exact("work/fix".into())),
+            channel: Some(ChannelSelector::exact("work/fix").unwrap()),
             ..Default::default()
         })
         .await,
@@ -1518,4 +1520,200 @@ pub async fn dependency_projection<S: Store>(s: Arc<S>) {
         s.dependents(std::slice::from_ref(&b.id)).await.unwrap(),
         vec![c.id.clone()]
     );
+}
+
+// ---------- channel patterns (HANDOFF 19.10, item 2) ----------
+
+/// A small, fixed pseudo-random sequence, so a failure is repeatable. Seed it
+/// with any number.
+pub struct Lcg(pub u64);
+impl Lcg {
+    pub fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    pub fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+        xs[(self.next() as usize) % xs.len()]
+    }
+}
+
+fn random_channel(r: &mut Lcg) -> String {
+    let depth = 1 + (r.next() % 4) as usize;
+    (0..depth)
+        .map(|_| r.pick(&["a", "b", "tests", "x_y", "features"]))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn random_pattern(r: &mut Lcg) -> String {
+    let depth = 1 + (r.next() % 3) as usize;
+    let mut p = (0..depth)
+        .map(|_| r.pick(&["a", "b", "tests", "x_y", "*", "**", "features"]))
+        .collect::<Vec<_>>()
+        .join("/");
+    if r.next() % 4 == 0 {
+        p.push('/');
+    }
+    p
+}
+
+/// A random selector: one to three patterns, sometimes an exclusion.
+pub fn random_selector(r: &mut Lcg) -> ChannelSelector {
+    let n = 1 + (r.next() % 3) as usize;
+    let mut parts: Vec<String> = (0..n).map(|_| random_pattern(r)).collect();
+    if r.next() % 3 == 0 {
+        parts.push(format!("!{}", random_pattern(r)));
+    }
+    ChannelSelector::parse_all(&parts).unwrap()
+}
+
+/// Every store query agrees with the core matcher, for random channels and
+/// patterns: event reads, message reads, task lists and the ready queue
+/// that `claim --ready` takes from.
+pub async fn channel_patterns_match_core<S: Store>(s: Arc<S>) {
+    let mut r = Lcg(19);
+    let mut channels = vec![];
+    for i in 0..40 {
+        let ch = random_channel(&mut r);
+        channels.push(ch.clone());
+        if i % 2 == 0 {
+            create_task(&*s, &ch, Labels::new(), lease(1_000, 3), i).await;
+        } else {
+            put(&*s, post_commit(&root(&ch, "hi", Labels::new(), i)))
+                .await
+                .unwrap();
+        }
+    }
+    let all_events = s
+        .read_events(&EventFilter::after(0, 10_000))
+        .await
+        .unwrap()
+        .events;
+    let all_tasks = s
+        .list_tasks(&TaskQuery {
+            limit: 10_000,
+            now: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let all_messages = s
+        .list_messages(&MessageQuery {
+            limit: 10_000,
+            now: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut fixed: Vec<ChannelSelector> = [
+        "**",
+        "*",
+        "**/tests",
+        "a/*",
+        "a/*/tests",
+        "**,!features/",
+        "a/,!a/*/tests",
+        "nowhere/*",
+        "a/**/b",
+    ]
+    .iter()
+    .map(|p| ChannelSelector::parse(p).unwrap())
+    .collect();
+    fixed.extend((0..150).map(|_| random_selector(&mut r)));
+    let mut partial = 0;
+    for sel in fixed {
+        let f = EventFilter {
+            channel: Some(sel.clone()),
+            limit: 10_000,
+            ..Default::default()
+        };
+        let got: Vec<u64> = s
+            .read_events(&f)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .map(|e| e.position)
+            .collect();
+        let want: Vec<u64> = all_events
+            .iter()
+            .filter(|e| f.matches(e))
+            .map(|e| e.position)
+            .collect();
+        assert_eq!(got, want, "events for {sel}");
+
+        let got: Vec<String> = s
+            .list_tasks(&TaskQuery {
+                channel: Some(sel.clone()),
+                limit: 10_000,
+                now: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.task.id)
+            .collect();
+        let want: Vec<String> = all_tasks
+            .iter()
+            .filter(|t| sel.matches(&t.task.channel))
+            .map(|t| t.task.id.clone())
+            .collect();
+        assert_eq!(got, want, "tasks for {sel}");
+        if !want.is_empty() && want.len() < all_tasks.len() {
+            partial += 1;
+        }
+
+        let ready = s
+            .list_tasks(&TaskQuery {
+                channel: Some(sel.clone()),
+                ..TaskQuery::ready(100)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            ready.first().map(|t| &t.task.id),
+            want.first(),
+            "oldest ready task for {sel}"
+        );
+
+        let got: Vec<String> = s
+            .list_messages(&MessageQuery {
+                channel: Some(sel.clone()),
+                limit: 10_000,
+                now: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.message.id)
+            .collect();
+        let want: Vec<String> = all_messages
+            .iter()
+            .filter(|m| sel.matches(&m.message.channel))
+            .map(|m| m.message.id.clone())
+            .collect();
+        assert_eq!(got, want, "messages for {sel}");
+    }
+    assert!(partial > 40, "the random selectors should mostly match some tasks, got {partial}");
+}
+
+/// A pattern read sees a channel made after an earlier read of the same
+/// pattern: nothing about the match is cached between transactions.
+pub async fn known_channels_include_new_ones<S: Store>(s: Arc<S>) {
+    let sel = ChannelSelector::parse("work/*/tests").unwrap();
+    let q = || TaskQuery {
+        channel: Some(sel.clone()),
+        ..TaskQuery::ready(100)
+    };
+    create_task(&*s, "work/tests", Labels::new(), lease(1_000, 3), 1).await;
+    assert!(s.list_tasks(&q()).await.unwrap().is_empty());
+    let t = create_task(&*s, "work/api/tests", Labels::new(), lease(1_000, 3), 2).await;
+    let got = s.list_tasks(&q()).await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].task.id, t.id);
 }

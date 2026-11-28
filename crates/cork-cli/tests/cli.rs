@@ -418,3 +418,35 @@ fn sigterm_releases_and_a_lost_daemon_exits_11() {
         "within one lease"
     );
 }
+
+/// HANDOFF 19.2: one argument holds comma-separated patterns.
+#[test]
+fn patterns_on_the_command_line() {
+    let e = Env::new();
+    let a = e.ok(&["tasks", "create", "work/api/tests", "a"]);
+    let _b = e.ok(&["tasks", "create", "work/tests", "b"]);
+    let c = e.ok(&["tasks", "create", "docs/howto", "c"]);
+    let ids = |sel: &str| -> Vec<String> {
+        e.json(&["tasks", "list", sel])["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ids("work/*/tests,docs/"), [a.clone(), c.clone()]);
+    assert_eq!(ids("**,!work/"), [c.clone()]);
+    let page = e.json(&["read", "work/*/tests"]);
+    assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        e.ok(&["--as", "w", "tasks", "claim", "--ready", "work/*/tests"])
+            .lines()
+            .next(),
+        Some(a.as_str())
+    );
+    // A partial wildcard is refused, with the reason.
+    let o = e.run(&["tasks", "list", "work-*"]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("whole segment"), "{err}");
+}
