@@ -85,6 +85,8 @@ enum Cmd {
     },
     /// Read a thread, or the latest messages in a channel.
     Read {
+        /// A thread id, or channel patterns: `work`, `work/`, `'work/*/tests,docs/'`.
+        /// Quote patterns with `*` so the shell leaves them alone.
         target: String,
         #[arg(long = "label")]
         labels: Vec<String>,
@@ -93,6 +95,8 @@ enum Cmd {
     },
     /// Wait for the next matching message.
     Wait {
+        /// A thread id, or channel patterns: `work`, `work/`, `'work/*/tests,docs/'`.
+        /// Quote patterns with `*` so the shell leaves them alone.
         target: String,
         #[arg(long = "label")]
         labels: Vec<String>,
@@ -141,7 +145,7 @@ enum Cmd {
         /// Only tasks created in this last stretch, such as 7d.
         #[arg(long, value_parser = parse_duration)]
         since: Option<Duration>,
-        /// Only these channels, such as work/.
+        /// Only these channels, such as work/ or 'work/*/tests'.
         #[arg(long)]
         channel: Option<String>,
         /// Only tasks with this label (k=v); repeatable.
@@ -269,6 +273,8 @@ struct MsgArgs {
 #[derive(Subcommand)]
 enum TaskCmd {
     List {
+        /// Channel patterns: `work`, `work/`, `'work/*/tests,docs/'`, `'**,!features/'`.
+        /// Quote patterns with `*` so the shell leaves them alone.
         selector: Option<String>,
         #[arg(long)]
         state: Option<String>,
@@ -396,7 +402,8 @@ enum TaskCmd {
 
 #[derive(Args)]
 struct ReadyArgs {
-    /// Claim the oldest ready task matching this selector.
+    /// Claim the oldest ready task matching these channel patterns, such as
+    /// `work/` or `'work/*/tests,docs/'` (quote `*`).
     #[arg(long)]
     ready: Option<String>,
     #[arg(long = "label")]

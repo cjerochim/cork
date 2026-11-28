@@ -13,10 +13,11 @@
 //!   version guard mismatch, is `internal`.
 
 use async_trait::async_trait;
+use cork_core::channel::Shape;
 use cork_core::labels::{MENTION_LABEL, TASK_LABEL};
 use cork_core::{
-    BoardError, ChannelSelector, ErrorCode, Message, Millis, Result, Task, TaskState, task_stream,
-    thread_stream,
+    BoardError, ChannelSelector, ErrorCode, Message, Millis, Pattern, Result, Task, TaskState,
+    task_stream, thread_stream,
 };
 use cork_store::*;
 use rusqlite::types::Value;
@@ -79,6 +80,10 @@ CREATE TABLE IF NOT EXISTS channels (
   messages      INTEGER NOT NULL,
   last_position INTEGER NOT NULL
 );
+
+-- Every channel that any event, message or task has used. Wildcard patterns
+-- are matched against this list to get the exact channels to query (HANDOFF 19.5).
+CREATE TABLE IF NOT EXISTS known_channels (path TEXT PRIMARY KEY) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS tasks (
   id               TEXT PRIMARY KEY,
@@ -229,6 +234,8 @@ impl SqliteStore {
         w.pragma_update(None, "synchronous", sync).sql()?;
         w.pragma_update(None, "temp_store", "MEMORY").sql()?;
         w.execute_batch(SCHEMA).sql()?;
+        fill_known_channels(&w)?;
+        register_functions(&w)?;
 
         let mut readers = Vec::new();
         for _ in 0..cfg.readers.max(1) {
@@ -238,6 +245,7 @@ impl SqliteStore {
             )
             .sql()?;
             r.busy_timeout(std::time::Duration::from_secs(5)).sql()?;
+            register_functions(&r)?;
             readers.push(Mutex::new(r));
         }
 
@@ -315,6 +323,119 @@ impl SqliteStore {
 
 // ---------- SQL building ----------
 
+static PATTERN_LIST_MAX: AtomicUsize = AtomicUsize::new(500);
+
+/// How many known channels a wildcard pattern may expand to before a query
+/// falls back to scanning by prefix (HANDOFF 19.5). 500 by default.
+pub fn pattern_list_max() -> usize {
+    PATTERN_LIST_MAX.load(Ordering::Relaxed)
+}
+
+/// Change [`pattern_list_max`] for this process. For tests and the stress
+/// run, which check that both paths give the same answer.
+#[doc(hidden)]
+pub fn set_pattern_list_max(n: usize) {
+    PATTERN_LIST_MAX.store(n, Ordering::Relaxed);
+}
+
+/// Record that a channel exists. Cheap: a primary-key probe.
+fn know_channel(tx: &Connection, channel: &str) -> Result<()> {
+    tx.prepare_cached("INSERT OR IGNORE INTO known_channels (path) VALUES (?1)")
+        .sql()?
+        .execute(params![channel])
+        .sql()?;
+    Ok(())
+}
+
+/// A database made before `known_channels` existed gets it filled once.
+fn fill_known_channels(c: &Connection) -> Result<()> {
+    let done: bool = c
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM meta WHERE key = 'known_channels')",
+            [],
+            |r| r.get(0),
+        )
+        .sql()?;
+    if done {
+        return Ok(());
+    }
+    c.execute_batch(
+        "BEGIN IMMEDIATE;
+         INSERT OR IGNORE INTO known_channels (path)
+           SELECT DISTINCT channel FROM events WHERE channel IS NOT NULL;
+         INSERT OR IGNORE INTO known_channels (path) SELECT DISTINCT channel FROM messages;
+         INSERT OR IGNORE INTO known_channels (path) SELECT DISTINCT channel FROM tasks;
+         INSERT OR IGNORE INTO meta (key, value) VALUES ('known_channels', '1');
+         COMMIT;",
+    )
+    .sql()
+}
+
+/// The known channels a wildcard pattern matches, by the core matcher, or
+/// `None` if there are more than [`pattern_list_max`].
+fn known_matching(c: &Connection, prefix: &str, pat: &Pattern) -> Result<Option<Vec<String>>> {
+    let max = pattern_list_max();
+    let mut out = Vec::new();
+    let mut push = |ch: String| {
+        if pat.matches(&ch) {
+            out.push(ch);
+        }
+        out.len() <= max
+    };
+    if prefix.is_empty() {
+        let mut st = c
+            .prepare_cached("SELECT path FROM known_channels ORDER BY path")
+            .sql()?;
+        let mut rows = st.query([]).sql()?;
+        while let Some(r) = rows.next().sql()? {
+            if !push(r.get(0).sql()?) {
+                return Ok(None);
+            }
+        }
+    } else {
+        // `prefix` itself, then everything from `prefix/` up to `prefix0`
+        // (`0` is the byte after `/`): exactly the channels under it.
+        let mut st = c
+            .prepare_cached(
+                "SELECT path FROM known_channels WHERE path = ?1 OR (path > ?2 AND path < ?3) ORDER BY path",
+            )
+            .sql()?;
+        let mut rows = st
+            .query(params![prefix, format!("{prefix}/"), format!("{prefix}0")])
+            .sql()?;
+        while let Some(r) = rows.next().sql()? {
+            if !push(r.get(0).sql()?) {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+/// `cork_match(pattern, channel)`: the core matcher, for the fallback scan.
+fn register_functions(c: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    c.create_scalar_function(
+        "cork_match",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let pat =
+                ctx.get_or_create_aux(0, |v| -> std::result::Result<Pattern, BoardError> {
+                    Pattern::parse(
+                        v.as_str()
+                            .map_err(|e| BoardError::internal(e.to_string()))?,
+                    )
+                })?;
+            Ok(match ctx.get_raw(1).as_str_or_null() {
+                Ok(Some(ch)) => pat.matches(ch),
+                _ => false,
+            })
+        },
+    )
+    .sql()
+}
+
 /// The one place effective task state is turned into SQL (HANDOFF 5.3).
 ///
 /// A predicate on the `tasks` row aliased `t` that is true when the task's
@@ -355,22 +476,62 @@ impl Query {
     fn and(&mut self, clause: String) {
         self.clauses.push(clause);
     }
-    /// `work` or `work/…`, compared by prefix bytes, never `LIKE` (`_` is a
-    /// legal channel character).
-    fn channel(&mut self, col: &str, sel: &ChannelSelector) {
-        match sel {
-            ChannelSelector::Exact(p) => {
-                let a = self.p(p.clone());
-                self.and(format!("{col} = {a}"));
-            }
-            ChannelSelector::Subtree(p) => {
-                let a = self.p(p.clone());
-                let prefix = format!("{p}/");
-                let n = self.p(prefix.len() as i64);
-                let b = self.p(prefix);
-                self.and(format!("({col} = {a} OR substr({col}, 1, {n}) = {b})"));
-            }
+    /// The channel test for a selector (HANDOFF 19.5): any ordinary pattern
+    /// and no `!` pattern. Plain channels and subtrees compare bytes, never
+    /// `LIKE` (`_` is a legal channel character). A wildcard pattern is
+    /// first matched against `known_channels` in this same transaction, and
+    /// the query filters on that exact list, so the `(channel, …)` indexes
+    /// still apply. A list longer than [`pattern_list_max`] falls back to a
+    /// prefix scan filtered by the core matcher.
+    fn channel(&mut self, c: &Connection, col: &str, sel: &ChannelSelector) -> Result<()> {
+        let mut any = Vec::new();
+        for p in sel.includes() {
+            any.push(self.pattern(c, col, p)?);
         }
+        let mut clause = format!("({})", any.join(" OR "));
+        for p in sel.excludes() {
+            let not = self.pattern(c, col, p)?;
+            clause = format!("{clause} AND NOT {not}");
+        }
+        self.and(format!("({clause})"));
+        Ok(())
+    }
+    fn subtree(&mut self, col: &str, p: &str) -> String {
+        let a = self.p(p.to_string());
+        let prefix = format!("{p}/");
+        let n = self.p(prefix.len() as i64);
+        let b = self.p(prefix);
+        format!("({col} = {a} OR substr({col}, 1, {n}) = {b})")
+    }
+    fn pattern(&mut self, c: &Connection, col: &str, pat: &Pattern) -> Result<String> {
+        Ok(match pat.shape() {
+            Shape::Exact(p) => {
+                let a = self.p(p);
+                format!("({col} = {a})")
+            }
+            Shape::Subtree(p) => self.subtree(col, &p),
+            Shape::All => format!("({col} IS NOT NULL)"),
+            Shape::Wild { prefix, pattern } => {
+                let list = known_matching(c, &prefix, pattern)?;
+                match list {
+                    Some(list) if list.is_empty() => "(0)".to_string(),
+                    Some(list) => {
+                        let ps: Vec<String> = list.into_iter().map(|ch| self.p(ch)).collect();
+                        format!("({col} IN ({}))", ps.join(", "))
+                    }
+                    None => {
+                        let m = self.p(pattern.to_string());
+                        let test = format!("cork_match({m}, {col})");
+                        if prefix.is_empty() {
+                            format!("({test})")
+                        } else {
+                            let under = self.subtree(col, &prefix);
+                            format!("({under} AND {test})")
+                        }
+                    }
+                }
+            }
+        })
     }
     fn where_sql(&self) -> String {
         if self.clauses.is_empty() {
@@ -466,7 +627,7 @@ fn list_tasks(c: &Connection, q: &TaskQuery) -> Result<Vec<StoredTask>> {
         s.and(state_pred("t", st, &now));
     }
     if let Some(ch) = &q.channel {
-        s.channel("t.channel", ch);
+        s.channel(c, "t.channel", ch)?;
     }
     if let Some(o) = &q.owner {
         let a = s.p(o.clone());
@@ -572,7 +733,7 @@ fn read_events(c: &Connection, f: &EventFilter) -> Result<EventPage> {
         s.and(format!("e.stream_id = {a}"));
     }
     if let Some(ch) = &f.channel {
-        s.channel("e.channel", ch);
+        s.channel(c, "e.channel", ch)?;
     }
     if let Some(t) = &f.thread_id {
         let a = s.p(t.clone());
@@ -719,7 +880,7 @@ fn list_messages(c: &Connection, q: &MessageQuery) -> Result<Vec<StoredMessage>>
     let mut s = Query::new();
     let now = s.p(q.now);
     if let Some(ch) = &q.channel {
-        s.channel("m.channel", ch);
+        s.channel(c, "m.channel", ch)?;
     }
     if let Some(t) = &q.thread_id {
         let a = s.p(t.clone());
@@ -879,6 +1040,9 @@ fn apply_commit(tx: &Connection, commit: &Commit) -> Result<Vec<StoredEvent>> {
                 e.meta.thread_id
             ])
             .sql()?;
+            if let Some(ch) = &e.meta.channel {
+                know_channel(tx, ch)?;
+            }
             position += 1;
             {
                 let mut st = tx
@@ -965,6 +1129,9 @@ fn insert_event(tx: &Connection, e: &StoredEvent) -> Result<()> {
         e.meta.thread_id
     ])
     .sql()?;
+    if let Some(ch) = &e.meta.channel {
+        know_channel(tx, ch)?;
+    }
     let task_event = e.stream_id.starts_with("task:");
     let mut st = tx
         .prepare_cached(
@@ -983,6 +1150,11 @@ fn insert_event(tx: &Connection, e: &StoredEvent) -> Result<()> {
 
 /// Write every projection row the log implies.
 fn write_derived(tx: &Connection, events: &[StoredEvent]) -> Result<()> {
+    for e in events {
+        if let Some(ch) = &e.meta.channel {
+            know_channel(tx, ch)?;
+        }
+    }
     let d = cork_store::replay::derive(events)?;
     for (m, pos) in &d.messages {
         project_message(tx, m, *pos)?;
@@ -993,10 +1165,11 @@ fn write_derived(tx: &Connection, events: &[StoredEvent]) -> Result<()> {
     Ok(())
 }
 
-const PROJECTION_TABLES: [&str; 6] = [
+const PROJECTION_TABLES: [&str; 7] = [
     "messages",
     "message_labels",
     "channels",
+    "known_channels",
     "tasks",
     "task_labels",
     "task_dependencies",
@@ -1062,6 +1235,7 @@ impl SqliteStore {
 }
 
 fn project_message(tx: &Connection, m: &Message, pos: u64) -> Result<()> {
+    know_channel(tx, &m.channel)?;
     tx.prepare_cached(
         "INSERT INTO messages (id, position, thread_id, channel, is_root, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
@@ -1101,6 +1275,7 @@ fn project_message(tx: &Connection, m: &Message, pos: u64) -> Result<()> {
 
 /// Insert or update a task row. `created` is its queue place, used on insert.
 fn project_task(tx: &Connection, t: &Task, created: u64) -> Result<()> {
+    know_channel(tx, &t.channel)?;
     let exists: bool = tx
         .prepare_cached("SELECT EXISTS (SELECT 1 FROM tasks WHERE id = ?1)")
         .sql()?

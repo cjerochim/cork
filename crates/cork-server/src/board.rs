@@ -1002,11 +1002,17 @@ impl<S: Store> Board<S> {
                 .await;
         }
 
-        let channel = ChannelSelector::parse(
-            req.channel
-                .as_deref()
-                .ok_or_else(|| BoardError::invalid("claim needs task_id or channel"))?,
-        )?;
+        let patterns: Vec<&str> = req
+            .channel
+            .iter()
+            .chain(&req.channels)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if patterns.is_empty() {
+            return Err(BoardError::invalid("claim needs task_id or channel"));
+        }
+        let channel = ChannelSelector::parse_all(patterns)?;
         let labels = parse_filter(&req.labels)?;
         let owner = match req.from.as_deref() {
             None => Some(person.clone()),

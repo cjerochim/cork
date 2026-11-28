@@ -47,6 +47,7 @@ async fn main() {
             Scenario::Soak,
             Scenario::Lead,
             Scenario::Deps,
+            Scenario::Patterns,
         ],
     };
     let mut ok = true;

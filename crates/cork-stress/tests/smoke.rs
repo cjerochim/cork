@@ -63,3 +63,8 @@ async fn lead() {
 async fn deps() {
     go(Scenario::Deps).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn patterns() {
+    go(Scenario::Patterns).await;
+}

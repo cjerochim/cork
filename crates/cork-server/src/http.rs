@@ -336,7 +336,9 @@ async fn thread<S: Store>(
 
 #[derive(Debug, Default, Deserialize)]
 struct MessagesQ {
-    channel: Option<String>,
+    /// Channel patterns; may repeat, and each may hold several, comma-separated (HANDOFF 19.2).
+    #[serde(default)]
+    channel: Vec<String>,
     thread: Option<String>,
     #[serde(default)]
     label: Vec<String>,
@@ -350,11 +352,12 @@ struct MessagesQ {
     newest: bool,
 }
 
-fn selector(s: &Option<String>) -> ApiResult<Option<ChannelSelector>> {
-    Ok(s.as_deref()
-        .filter(|s| !s.is_empty())
-        .map(ChannelSelector::parse)
-        .transpose()?)
+fn selector(s: &[String]) -> ApiResult<Option<ChannelSelector>> {
+    let parts: Vec<&String> = s.iter().filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ChannelSelector::parse_all(parts)?))
 }
 
 async fn messages<S: Store>(
@@ -383,7 +386,9 @@ async fn messages<S: Store>(
 #[derive(Debug, Default, Deserialize)]
 struct EventsQ {
     after: Option<u64>,
-    channel: Option<String>,
+    /// Channel patterns; may repeat, and each may hold several, comma-separated (HANDOFF 19.2).
+    #[serde(default)]
+    channel: Vec<String>,
     thread: Option<String>,
     stream: Option<String>,
     #[serde(default)]
@@ -532,7 +537,9 @@ async fn create_plan<S: Store>(
 
 #[derive(Debug, Default, Deserialize)]
 struct TasksQ {
-    channel: Option<String>,
+    /// Channel patterns; may repeat, and each may hold several, comma-separated (HANDOFF 19.2).
+    #[serde(default)]
+    channel: Vec<String>,
     state: Option<String>,
     #[serde(default)]
     label: Vec<String>,

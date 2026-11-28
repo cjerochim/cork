@@ -105,3 +105,40 @@ async fn rebuild_from_the_log_matches_the_live_projections() {
     let after = s.projection_dump().await.unwrap();
     assert_eq!(before, after);
 }
+
+#[tokio::test]
+async fn a_database_from_before_patterns_learns_its_channels_on_open() {
+    use cork_core::{ChannelSelector, CreateTask, Labels};
+    use cork_store::testkit::create_task;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.db");
+    let t = {
+        let s = SqliteStore::open(SqliteConfig::new(&path)).await.unwrap();
+        create_task(
+            &s,
+            "work/api/tests",
+            Labels::new(),
+            CreateTask::default(),
+            1,
+        )
+        .await
+    };
+    // Make it look like a database written before `known_channels` existed.
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "DELETE FROM known_channels; DELETE FROM meta WHERE key = 'known_channels';",
+        )
+        .unwrap();
+    }
+    let s = SqliteStore::open(SqliteConfig::new(&path)).await.unwrap();
+    let got = s
+        .list_tasks(&TaskQuery {
+            channel: Some(ChannelSelector::parse("work/*/tests").unwrap()),
+            ..TaskQuery::ready(2)
+        })
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].task.id, t.id);
+}

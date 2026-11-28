@@ -314,9 +314,14 @@ pub struct ClaimReq {
     /// Claim this task. Otherwise claim the oldest ready task in `channel`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
-    /// `work` for one channel, `work/` for it and everything under it.
+    /// `work` for one channel, `work/` for it and everything under it, or
+    /// patterns such as `work/*/tests` (HANDOFF 19). May hold several,
+    /// comma-separated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// More patterns, added to `channel`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<String>,
     /// `k=v` filters on the task's labels.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,

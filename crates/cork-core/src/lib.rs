@@ -14,7 +14,7 @@ pub mod schema;
 pub mod task;
 
 pub use actor::Actor;
-pub use channel::{ChannelSelector, normalize_channel};
+pub use channel::{ChannelSelector, Pattern, normalize_channel};
 pub use error::{BoardError, ErrorCode, Result};
 pub use labels::Labels;
 pub use message::{Message, NewMessage};

@@ -21,6 +21,8 @@ pub enum Scenario {
     Lead,
     /// Random dependencies and replacements under failing workers (6.8.9).
     Deps,
+    /// Wildcard selectors against plain ones, reads and claims (19.10).
+    Patterns,
 }
 
 /// Sizes for a run. `scale` shrinks counts and durations for quick runs.
@@ -100,6 +102,7 @@ pub async fn run(s: Scenario, p: &Params) -> Report {
         Scenario::Soak => soak(p).await,
         Scenario::Lead => crate::lead::lead(p).await,
         Scenario::Deps => crate::deps::deps(p).await,
+        Scenario::Patterns => crate::patterns::patterns(p).await,
     }
 }
 
