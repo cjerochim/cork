@@ -46,7 +46,7 @@ No tags exist yet, and `Cargo.toml` has said `0.1.0` since Milestone 1. Mileston
 |---|---|---|
 | `0.1.0` | Milestones 1–3: the board, tasks and leases, `tasks run`, worker fleets and keyword routing, escalation and the lead skill, usage capture, `cork stats`, `/metrics` | 11, 16, 17, 18 |
 | `0.2.0` | Task dependencies and the "waiting on tasks" state | 6.8 |
-| `0.3.0` | Server mode with SQLite | 13 |
+| `0.3.0` | Shared network board ("server mode"): the daemon listens beyond `127.0.0.1`, with TLS, one token per person, `cork login` and `cork admin tokens`. Today's daemon, its HTTP API and its event stream already ship in `0.1.0`, but only on localhost for one person. | 13 |
 | `0.4.0`+ | Grants, the web UI, MCP adapter, OpenTelemetry, in whatever order Chris picks | 13.3, 14, 18.5 |
 | `1.0.0` | The contracts in section 7 are frozen | |
 
@@ -179,7 +179,7 @@ dist can also publish a formula to a tap repo (for example `cjerochim/homebrew-t
 - CLI exit codes (HANDOFF 8.6) and the `--json` output shapes.
 - The config files (`~/.config/cork`, `models.toml`).
 
-Most of these are already written as stable in the spec. 1.0 is when they have also held up through server mode and real use.
+Most of these are already written as stable in the spec. 1.0 is when they have also held up through a shared network board ("server mode") and real use.
 
 ## 8. What changes in the repo
 
