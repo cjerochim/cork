@@ -1635,7 +1635,7 @@ Everything comes from routes that exist today, plus one optional route:
 
 - `crates/cork-server/ui/` holds the static files. A small `ui.rs` in `cork-server` serves them with the headers above.
 - `app.js` is split into three plain modules matching 20.2: `state.js` (the fold, with no DOM and no three.js), `layout.js` (rooms and slots), and `scene.js` (three.js). Only `scene.js` touches WebGL.
-- `state.js` and `layout.js` are tested with Node's built-in test runner against recorded event logs. That needs no npm packages, and CI already has Node for the npm release.
+- `state.js` and `layout.js` are tested with Node's built-in test runner against recorded event logs. That needs no npm packages, and GitHub's runners already have Node.
 
 ### 20.10 Done when
 
